@@ -1,0 +1,337 @@
+---
+title: "NTG ORF prediction"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(glue)
+
+pubdata <- read_xlsx('data/benchmark/cross_validation_data_summary_edited.xlsx')
+```
+
+Create dirs to store prediction results
+```{bash}
+mkdir ntg_price
+mkdir ntg_ribocode
+mkdir ntg_ribotish
+mkdir ntg_riborf
+mkdir ntg_ribotricer
+```
+
+### PRICE
+```{r}
+pubdata %>%
+    filter(lib_type %in% c('RPF')) %>%
+    mutate(cmd = paste0('/home/admin/local/Gedi_1.0.5/gedi -e Price -nthreads 16 -fdr 0.05 -skipmt -reads ',
+                        name, '.Aligned.sortedByCoord.out.bam -genomic ',
+                        if_else(species == 'human', 'hsa104', 'mmu106'),
+                        ' -prefix ntg_price/', name)) %>%
+    pull(cmd) %>% cat(sep = '\n')
+```
+
+### RiboCode
+```{r}
+pubdata %>%
+    filter(lib_type %in% c('RPF')) %>%
+    mutate(cmd = paste0('RiboCode -a ribocode/annot_', species,
+                        ' -c ', name, '_pre_config.txt -l no -g -s ATG -A CTG,GTG,TTG -m 5 ',
+                        '-o ntg_ribocode/', name)) %>%
+    pull(cmd) %>% cat(sep = '\n')
+```
+
+### Ribo-TISH
+```{r}
+gtf <- c(human = '/nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.104.gtf',
+         mouse = '/nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.106.gtf')
+genome <- c(human = '/nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.dna.primary_assembly.fa',
+            mouse = '/nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.dna.primary_assembly.fa')
+
+pubdata %>%
+    filter(lib_type %in% c('RPF')) %>%
+    mutate(cmd = paste0('ribotish predict -p4 --minaalen 5 --alt --altcodons CTG,GTG,TTG --framebest --fsqth 0.05 -b ',
+                        name, '.Aligned.sortedByCoord.out.bam -g ', gtf[species],
+                        ' -f ', genome[species], ' -o ntg_ribotish/', name, '_pred.txt ')) %>%
+    pull(cmd) %>% cat(sep = '\n')
+```
+
+### RiboTricer
+```bash
+ribotricer prepare-orfs --gtf /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.104.gtf --fasta /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.dna.primary_assembly.fa --prefix ntg_ribotricer/human --min_orf_length 15 --start_codons ATG,CTG,GTG,TTG --longest
+
+ribotricer prepare-orfs --gtf /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.106.gtf --fasta /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.dna.primary_assembly.fa --prefix ntg_ribotricer/mouse --min_orf_length 15 --start_codons ATG,CTG,GTG,TTG --longest
+```
+```{r}
+# ribotricer detect-orfs --stranded yes --phase_score_cutoff 0.440 --bam Human_ERR2812352Aligned.sortedByCoord.out.bam --ribotricer_index ribotricer_human_candidate_orfs.tsv --prefix ERR2812352
+pubdata %>%
+    filter(lib_type %in% c('RPF')) %>%
+    mutate(cmd = paste0('ribotricer detect-orfs --stranded yes --phase_score_cutoff ',
+                        if_else(species == 'human', 0.440, 0.418), ' --bam ',
+                        name, '.Aligned.sortedByCoord.out.bam --ribotricer_index ntg_ribotricer/',
+                        species, '_candidate_orfs.tsv --prefix ntg_ribotricer/', name)) %>%
+    pull(cmd) %>% cat(sep = '\n')
+```
+
+### RibORF
+```bash
+perl /home/admin/local/RibORF.2.0/ORFannotate.pl  -s "ATG/CTG/GTG/TTG" -l 18 -g /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.dna.primary_assembly.fa -t riborf/Homo_sapiens.GRCh38.104.genePred.txt -o ntg_riborf/human
+
+perl /home/admin/local/RibORF.2.0/ORFannotate.pl  -s "ATG/CTG/GTG/TTG" -l 18 -g /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.dna.primary_assembly.fa -t riborf/Mus_musculus.GRCm39.106.genePred.txt -o ntg_riborf/mouse
+```
+
+```{r}
+riborf_candi_orf <- c(human = 'ntg_riborf/human/candidateORF.genepred.txt',
+                      mouse = 'ntg_riborf/mouse/candidateORF.genepred.txt')
+
+pubdata %>%
+    filter(lib_type %in% c('RPF')) %>%
+    mutate(cmd = glue('perl /home/admin/local/RibORF.2.0/ribORF.pl -f {name}.hisat2.corrected.sam -c ',
+                      '{riborf_candi_orf[species]} -o ntg_riborf/{name}')) %>%
+    pull(cmd) %>% cat(sep = '\n')
+```
+
+#### post-prediction processing
+```{r}
+txinfo <- c(
+    human = '/nfs_data/database/ref_genomes/human_GRCh38p13/ens104/txinfo_human_ens104.tsv',
+    mouse = '/nfs_data/database/ref_genomes/mouse_GRCm39/ens106/txinfo_mouse_ens106.tsv'
+)
+
+x1 <- pubdata %>%
+    filter(lib_type %in% c('RPF')) %>%
+    mutate(cmd = glue('python ~admin/scripts/orf_type.py -m price -p ntg_price/{name}.price ',
+                      'ntg_price/{name}.orfs.tsv {gtf[species]} {txinfo[species]}')) %>%
+    pull(cmd)
+x1 %>% cat(sep = '\n')
+
+x2 <- pubdata %>%
+    filter(lib_type %in% c('RPF')) %>%
+    mutate(cmd = glue('python ~admin/scripts/orf_type.py -m ribocode -p ntg_ribocode/{name}.ribocode ',
+                      'ntg_ribocode/{name}_collapsed.txt {gtf[species]} {txinfo[species]}')) %>%
+    pull(cmd)
+x2 %>% cat(sep = '\n')
+
+x3 <- pubdata %>%
+    filter(lib_type %in% c('RPF')) %>%
+    mutate(cmd = glue('python ~admin/scripts/orf_type.py -m ribotish -p ntg_ribotish/{name}.ribotish ',
+                      'ntg_ribotish/{name}_pred.txt {gtf[species]} {txinfo[species]}')) %>%
+    pull(cmd)
+x3 %>% cat(sep = '\n')
+
+x4 <- pubdata %>%
+    filter(lib_type %in% c('RPF')) %>%
+    mutate(cmd = glue('python ~admin/scripts/orf_type.py -m ribotricer -p ntg_ribotricer/{name}.ribotricer ',
+                      'ntg_ribotricer/{name}_translating_ORFs.tsv {gtf[species]} {txinfo[species]}')) %>%
+    pull(cmd)
+x4 %>% cat(sep = '\n')
+
+x5 <- pubdata %>%
+    filter(lib_type %in% c('RPF')) %>%
+    mutate(cmd = glue('python ~admin/scripts/orf_type.py -m riborf -p ntg_riborf/{name}.riborf ',
+                      'ntg_riborf/{name} {gtf[species]} {txinfo[species]}')) %>%
+    pull(cmd)
+x5 %>% cat(sep = '\n')
+
+cat(c(x1, x2, x3, x4, x5), sep = '\n')
+```
+
+### run PSite pipeline for Ribo-Seq
+```{r}
+cdna <- c(
+    human = '/nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.cdna.all.fa.gz',
+    mouse = '/nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.cdna.all.fa.gz'
+)
+
+# train
+pubdata |>
+    filter(lib_type %in% c('RPF')) |>
+    mutate(
+        name2 = str_remove(name, r"(.RPF.r\d$)"),
+        name2 = str_replace(name2, 'BMDC.*', 'BMDC.LPS'),
+        cmd = glue(
+        'psite train -i -t salmon -e salmon_{name2}.RNA/quant.sf {cdna[species]} {name}.Aligned.toTranscriptome.out.bam ',
+        'psite_cov/{name}.psite {txinfo[species]}'
+    )) |>
+    pull(cmd) |> 
+    cat(sep = '\n')
+
+# predict
+pubdata |>
+    filter(lib_type %in% c('RPF')) |>
+    mutate(cmd = glue(
+        'psite predict {genome[species]} {name}.Aligned.sortedByCoord.out.bam ',
+        'psite_cov/{name}.psite.gbt.pickle psite_cov/{name}.genome.psite.bam'
+    )) |>
+    pull(cmd) |> 
+    cat(sep = '\n')
+
+# index from cmdline: for i in *.bam; do samtools index $i; done
+
+# coverage
+pubdata |>
+    filter(lib_type %in% c('RPF')) |>
+    mutate(cmd = glue(
+        'psite coverage psite_cov/{name}.genome.psite.bam psite_cov/{name}.genome.psite'
+    )) |>
+    pull(cmd) |> 
+    cat(sep = '\n')
+
+```
+
+### run orf_quant, orf_floss, orf_kozak
+```{bash}
+mkdir genome_annot
+
+gppy convert2bed -g /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.104.gtf >genome_annot/Homo_sapiens.GRCh38.104.transcripts.bed12
+
+gppy convert2bed -t cds -g /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.104.gtf | bedtools bed12tobed6 | bedtools sort | bedtools merge -s -c 4,5,6 -o first > genome_annot/Homo_sapiens.GRCh38.104.cdsmerge.bed
+
+gppy convert2bed -g /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.106.gtf >genome_annot/Mus_musculus.GRCm39.106.transcripts.bed12
+
+gppy convert2bed -t cds -g /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.106.gtf | bedtools bed12tobed6 | bedtools sort | bedtools merge -s -c 4,5,6 -o first > genome_annot/Mus_musculus.GRCm39.106.cdsmerge.bed
+```
+
+```{r}
+txbed12 <- c(
+    human = 'genome_annot/Homo_sapiens.GRCh38.104.transcripts.bed12',
+    mouse = 'genome_annot/Mus_musculus.GRCm39.106.transcripts.bed12'
+)
+cds_merge <- c(
+    human = 'genome_annot/Homo_sapiens.GRCh38.104.cdsmerge.bed',
+    mouse = 'genome_annot/Mus_musculus.GRCm39.106.cdsmerge.bed'
+)
+
+tmp <- pubdata |> filter(lib_type %in% c('RPF')) |> select(name, species)
+tmp <- bind_rows(tmp, tmp, tmp, tmp, tmp) |>
+    mutate(method = rep(c('price', 'ribocode', 'ribotish', 'riborf', 'ribotricer'), each=nrow(tmp)))
+
+# quant
+tmp |>
+    mutate(cmd = glue(
+        'python ~admin/scripts/orf_quant.py psite_cov/{name}.genome.psite_fw.bw psite_cov/{name}.genome.psite_rc.bw',
+        ' {txbed12[species]} ntg_{method}/{name}.{method}_processed.tsv '
+    )) |>
+    pull(cmd) |> cat(sep = '\n')
+
+# floss
+tmp |>
+    mutate(cmd = glue(
+        'python ~admin/scripts/orf_floss.py psite_cov/{name}.genome.psite.bam {gtf[species]} ',
+        '{txinfo[species]} {cds_merge[species]} ntg_{method}/{name}.{method}_processed.tsv ',
+        ''
+    )) |>
+    pull(cmd) |> cat(sep = '\n')
+
+tmp |>
+    mutate(cmd = glue(
+        'Rscript --vanilla ~admin/scripts/orf_floss_cutoff.R ntg_{method}/{name}.{method}_processed.tsv.floss ',
+        'ntg_{method}/{name}.{method}_processed.floss.tsv'
+    )) |>
+    pull(cmd) |> cat(sep = '\n')
+
+# kozak
+ncrna <- c(
+    human = '/nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.ncrna.fa.gz',
+    mouse = '/nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.ncrna.fa.gz'
+)
+
+tmp |>
+    mutate(cmd = glue(
+        'python ~admin/scripts/orf_kozak.py -i -f {cdna[species]} -f {ncrna[species]} ',
+        'ntg_{method}/{name}.{method}_processed.tsv >ntg_{method}/{name}.{method}_processed.kozak.tsv'
+    )) |>
+    pull(cmd) |> cat(sep = '\n')
+
+# combine
+tmp |>
+    mutate(cmd = glue(
+        'python ~admin/scripts/orf_mergetab.py ntg_{method}/{name}.{method}_processed.tsv ',
+        '-q ntg_{method}/{name}.{method}_processed.orfquant.tsv ',
+        '-f ntg_{method}/{name}.{method}_processed.floss.tsv ',
+        '-k ntg_{method}/{name}.{method}_processed.kozak.tsv ',
+        '-o ntg_{method}/{name}.{method}_processed.merged.tsv'
+    )) |>
+    pull(cmd) |> cat(sep = '\n')
+
+```
+
+### Fraction of RPFs that are assigned to frame 0 by PSite
+```{r}
+# wd: /nfs_data/zhangh/ncorf_benchmark/benchmark/psite_cov
+library(tidyverse)
+
+files <- list.files(pattern='*.psite.log$', full.names=T)
+names(files) <- str_remove(basename(files), '.psite.log')
+
+psite_stat <- lapply(files, read_table, n_max=3, skip=28, col_names=F)
+psite_stat <- bind_rows(psite_stat, .id='lib')
+names(psite_stat) <- c('lib', 'frame', 'none', 'base', 'psite')
+
+write_tsv(psite_stat, 'data/lib_psite_frame_stat_combined.tsv')
+```
+
+### Run PSite pipeline for TI-seq
+```{r}
+cdna_ncrna <- c(
+    'human' = '/nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.cdna_and_ncrna.primary.fa',
+    'mouse' = '/nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.cdna_and_ncrna.fa')
+
+# train
+pubdata |>
+    filter(lib_type %in% c('LTM', 'HTN', 'QTI')) |>
+    mutate(
+        name2 = str_remove(name, r"(.[A-Z]{3}.r\d$)"),
+        name2 = str_replace(name2, 'BMDC.*', 'BMDC.LPS'),
+        cmd = glue(
+        'psite train -i -t salmon -e salmon_{name2}.RNA/quant.sf {cdna[species]} {name}.Aligned.toTranscriptome.out.bam ',
+        'psite_tiseq/{name}.psite {txinfo[species]}'
+    )) |>
+    pull(cmd) |> 
+    cat(sep = '\n')
+
+# manually set "-f 0.2" for BMDC HTN / LTM
+
+# predict
+pubdata |>
+    filter(lib_type %in% c('LTM', 'HTN', 'QTI')) |>
+    mutate(cmd = glue(
+        'psite predict -i {cdna_ncrna[species]} {name}.Aligned.toTranscriptome.out.bam ',
+        'psite_tiseq/{name}.psite.gbt.pickle psite_tiseq/{name}.cdna.psite.bam'
+    )) |>
+    pull(cmd) |> 
+    cat(sep = '\n')
+```
+
+sort and index
+```{bash}
+for i in *.bam; do echo samtools sort -o ${i%%.bam}.sorted.bam $i; done
+for i in *.sorted.bam; do samtools index $i; done
+```
+
+```{r}
+# coverage
+pubdata |>
+    filter(lib_type %in% c('LTM', 'HTN', 'QTI')) |>
+    mutate(cmd = glue(
+        'psite coverage psite_tiseq/{name}.cdna.psite.sorted.bam psite_tiseq/{name}.cdna.psite'
+    )) |>
+    pull(cmd) |> 
+    cat(sep = '\n')
+```
+
+### Extract TI-seq coverage for ORFs
+```{r}
+cat(sapply(c('price', 'ribocode', 'riborf', 'ribotish', 'ribotricer'), function(m){
+    pubdata %>%
+        filter(lib_type %in% c('RPF')) %>%
+        mutate(
+            tis_type = sub(r'(.*?\.([A-Z]+)\.r\d$)', r'(\1)', tis_sample),
+            cmd = glue(
+                'python ../src/extract_tis_cov.py -o ntg_{m}/{name}.{m}_processed.cov_{tis_type}.tsv ',
+                'ntg_{m}/{name}.{m}_processed.tsv psite_tiseq/{tis_sample}.cdna.psite_fw.bw')) %>%
+        pull(cmd)
+}), sep = '\n')
+```

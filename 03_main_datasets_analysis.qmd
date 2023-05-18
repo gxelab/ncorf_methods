@@ -1,0 +1,1012 @@
+---
+title: "NTG ORF analysis"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+### Read ORFs
+Basic environmental settings
+```{r}
+library(data.table)
+library(ggplot2)
+library(glue)
+library(eulerr)
+library(patchwork)
+library(forcats)
+library(stringi)
+library(stringr)
+library(ggseqlogo)
+
+theme_set(theme_classic(base_size = 12) + theme(
+    axis.text = element_text(color = 'black'),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12),
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5)))
+
+level_orftypes <- c("lncORF", "uORF", "uoORF", "iORF", "doORF", "dORF")
+factorize_orftypes <- function(x){
+    factor(x, levels = c("lncRNA-ORF", "uORF", "uoORF", "iORF", "doORF", "dORF"),
+           labels = level_orftypes)
+}
+
+# color scale from ColorBrewer2
+color_orftypes <- c('#66c2a5','#fc8d62','#8da0cb','#e78ac3','#a6d854','#ffd92f')
+color_starts <- c('#7fc97f','#beaed4','#fdc086','#ffff99')
+color_species <- c('#386cb0', '#bf5b17')
+```
+
+Generate name alias
+```{r}
+symname <- c(
+    human.HEK293.control.RPF.r1 = "Human HEK293 control", human.HEK293.starvation.RPF.r1 = "Human HEK293 starved", 
+    human.iCM.normal.RPF.r1 = "Human iCM normal r1", human.iCM.normal.RPF.r2 = "Human iCM normal r2", 
+    human.iCM.normal.RPF.r3 = "Human iCM normal r3", human.iPSC.normal.RPF.r1 = "Human iPSC normal r1", 
+    human.iPSC.normal.RPF.r2 = "Human iPSC normal r2", human.iPSC.normal.RPF.r3 = "Human iPSC normal r3", 
+    mouse.BMDC.naive.RPF.r1 = "Mouse BMDC naive", mouse.BMDC.LPS6h.RPF.r1 = "Mouse BMDC LPS6h", 
+    mouse.BMDC.LPS12h.RPF.r1 = "Mouse BMDC LPS12h", mouse.Liver.control.RPF.r1 = "Mouse Liver control", 
+    mouse.Liver.fasting.RPF.r1 = "Mouse Liver fasting", mouse.MEF.control.RPF.r1 = "Mouse MEF control", 
+    mouse.MEF.starvation.RPF.r1 = "Mouse MEF starved")
+```
+
+Library QC
+```{r}
+lib_stat <- fread('data/lib_psite_frame_stat_combined.tsv')
+lib_stat <- lib_stat[frame == 0]
+
+# too many BMDC, keep representative samples
+libs_exclude <- c("mouse.BMDC.LPS1h.RPF.r1", "mouse.BMDC.LPS2h.RPF.r1", 
+                  "mouse.BMDC.LPS30min.RPF.r1", "mouse.BMDC.LPS4h.RPF.r1",  
+                  "mouse.BMDC.LPS8h.RPF.r1", "mouse.BMDC.LPS9h.RPF.r1")
+lib_stat <- lib_stat[!lib %in% libs_exclude]
+lib_stat[, lib_name := symname[lib]]
+
+lib_stat[, lib_name := factor(lib_name, levels = rev(lib_name))]
+ggplot(lib_stat, aes(y = lib_name, x = base)) +
+    geom_col() +
+    labs(y = NULL, x = 'Reads assigned to frame 0') +
+    scale_x_continuous(expand = expansion(mult = c(0, 0.02))) +
+    geom_vline(xintercept = 0.5, linetype = 2)
+ggsave('figures/library_psite_frame_stat.pdf', width = 6, height = 5)
+```
+
+Read transcript annotations
+```{r}
+txinfo_human <- fread('data/txinfo_human_ens104.tsv')
+txinfo_mouse <- fread('data/txinfo_mouse_ens106.tsv')
+
+appris_tsl_human <- fread('data/ens104_human_mane_appris_tsl.tsv')
+setnames(appris_tsl_human, c('gene_id', 'tx_name', 'mane_select', 'appris', 'tsl'))
+sum(txinfo_human$tx_name %in% appris_tsl_human$tx_name) # all in
+
+# appris_tsl_human[, mane_select := ifelse(mane_select != '', 1, 2)]
+appris_tsl_human[, mane_select := NULL]
+appris_tsl_human[, tsl := sub(' .*', '', tsl)]
+appris_tsl_human[, tsl := factor(ifelse(tsl == '', 'tslNA', tsl))]
+appris_tsl_human[, appris := factor(appris, levels = c(
+    c("principal1", "principal2", "principal3", "principal4", "principal5",
+      "alternative1", "alternative2", "")))]
+
+appris_tsl_mouse <- fread('data/ens106_mouse_appris_tsl.tsv')
+setnames(appris_tsl_mouse, c('gene_id', 'tx_name', 'appris', 'tsl'))
+appris_tsl_mouse[, tsl := sub(' .*', '', tsl)]
+appris_tsl_mouse[, tsl := factor(ifelse(tsl == '', 'tslNA', tsl))]
+appris_tsl_mouse[, appris := factor(appris, levels = c(
+    c("principal1", "principal2", "principal3", "principal4", "principal5",
+      "alternative1", "alternative2", "")))]
+```
+
+```{r}
+get_ncorfs <- function(xpath){
+    # exclude annotated CDSs or truncation/extension variants
+    type_cds <- c(
+        'CDS', 'C_extension', 'C_truncation', 'N_extension',
+        'N_truncation', 'sCDS', 'iCDS', 'wCDS')
+    type_ncorf <- c('uORF', 'uoORF', 'iORF', 'doORF', 'dORF', 'lncRNA-ORF')
+    dtt <- fread(xpath)
+    dtt[, uuid := glue_data(.SD, '{chrom}_{gstart}_{gend}_{orf_len}{strand}')]
+    cds_variants <- dtt[orf_type %in% type_cds]
+    orfs <- dtt[!uuid %in% cds_variants$uuid]
+    orfs <- orfs[orf_type %in% type_ncorf]
+    orfs <- orfs[psite_total >= 10 & psite_total / n_codon >= 0.5]
+    
+    # assign ORFs to a single transcript based on appris/tsl score
+    if(grepl('human', xpath)){
+        orfs <- merge(orfs, appris_tsl_human, by = c('gene_id', 'tx_name'))
+    }else{
+        orfs <- merge(orfs, appris_tsl_mouse, by = c('gene_id', 'tx_name'))
+    }
+    orfs <- orfs[order(gene_id, appris, tsl, tx_name)]
+    orfs <- orfs[!duplicated(uuid)]
+    
+    # merge ORFs that are in the same transcripts and have the same stop codon
+    # keep the most upstream best-tier start codons
+    orfs[, start_tier := fct_collapse(
+        start_codon, AUG = 'ATG', SUG = c('CTG', 'GTG'),
+        UUG = 'TTG', other_level = 'other')]
+    orfs <- orfs[order(tx_name, tend, start_tier, tstart)]
+    orfs <- unique(orfs, by = c('tx_name', 'tend'))
+    # exclude non-NTG start codons (mainly from PRICE,
+    # which doesn't allow setting candidate start codons)
+    orfs <- orfs[start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG')]
+    return(orfs)
+}
+
+files_ntg_orfs <- list.files('data/benchmark_ntg', pattern = '.merged.tsv', full.names = TRUE)
+names(files_ntg_orfs) <- sub('_processed.merged.tsv', '', basename(files_ntg_orfs))
+
+ntg_orfs <- rbindlist(lapply(files_ntg_orfs, get_ncorfs), idcol = 'lib')
+ntg_orfs[, c('method', 'lib') := apply(
+    stri_split_fixed(stri_reverse(lib), pattern = '.', n = 2, simplify = TRUE),
+    2, stri_reverse, simplify = F)]
+
+ntg_orfs <- ntg_orfs[!lib %in% libs_exclude]
+
+method_map <- c("price" = 'PRICE', "ribocode" = 'RiboCode', "riborf" = 'RibORF',
+                "ribotish" = 'Ribo-TISH', "ribotricer" = 'RiboTricer')
+ntg_orfs[, method := method_map[method]]
+
+ntg_orfs[, orf_type := factorize_orftypes(orf_type)]
+```
+
+Add TI-Seq stats
+```{r}
+tiscov_files <- list.files('data/benchmark_ntg_tiscov', full.names = TRUE)
+names(tiscov_files) <- sub(r'(.*/(.*\.[a-z]+)_processed.*)', r'(\1)', tiscov_files)
+# determine peaks
+tmp <- mapply(function(path_cov, path_orfs){
+    dtt_cov <- fread(path_cov)
+    dtt_cov[, c('tstart', 'tend') := NULL]
+    
+    dtt_orfs <- get_ncorfs(path_orfs)
+    dtt_orfs <- dtt_orfs[start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG')]
+
+    bycols <- c('orf_id', 'tx_name')
+    cov_orfs <- merge(dtt_cov, dtt_orfs[, ..bycols], by = bycols)
+    
+    setnafill(cov_orfs, fill = 0L, cols = c(str_c('u', 5:1), str_c('d', 0:5)))
+    cov_orfs[, tis_peak := (u1 + d0 + d1) > (u2 + u3 + u4) & (u1 + d0 + d1) > (d2 + d3 + d4)]
+    cov_orfs[, .(orf_id, tx_name, tis_peak, tis_d0 = d0)]
+}, tiscov_files, files_ntg_orfs[names(tiscov_files)], SIMPLIFY = FALSE)
+
+tiscov <- rbindlist(tmp, idcol = 'lib')
+tiscov[, c('method', 'lib') := apply(
+    stri_split_fixed(stri_reverse(lib), pattern = '.', n = 2, simplify = TRUE),
+    2, stri_reverse, simplify = F)]
+
+tiscov <- tiscov[!lib %in% libs_exclude]
+tiscov[, method := method_map[method]]
+fwrite(tiscov, file = 'results/all_ntg_orfs_filtered_merged_tiseq_peak.tsv')
+
+ntg_orfs <- merge(ntg_orfs, tiscov, by = c('lib', 'method', 'orf_id', 'tx_name'))
+fwrite(ntg_orfs, 'results/all_ntg_orfs_filtered_merged.tsv', sep = '\t')
+```
+
+Optional for lazy loading
+```{r}
+if(FALSE){
+    ntg_orfs <- fread('results/all_ntg_orfs_filtered_merged.tsv')
+    ntg_orfs[, orf_type := factor(orf_type, levels = level_orftypes)]
+}
+```
+
+update uuid, add uid
+```{r}
+ntg_orfs[, uuid := str_c(ifelse(str_starts(lib, 'human'), 'hsa_', 'mmu_'), uuid)]
+ntg_orfs[, uid := glue_data(.SD, "{ifelse(str_starts(lib, 'human'), 'hsa_', 'mmu_')}{chrom}_{gend}{strand}")]
+```
+
+### Overview
+Number of ORFs in each sample
+```{r}
+plt <- ntg_orfs[, .N, by = .(lib, method)]
+plt[, sample := symname[lib]]
+
+# labels = scales::label_number(scale = 1/1000, big.mark = ',', suffix = 'k')
+f1a <- ggplot(plt, aes(x = sample, y = N, fill = method)) +
+    geom_col(position = 'dodge') +
+    scale_fill_brewer(palette = 'Dark2') +
+    labs(x = NULL, y = 'Number of non-canonical ORFs', fill = NULL) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.02)),trans = 'log2',
+                       breaks = c(1, 3, 10, 30, 100, 300, 1000, 3000, 10000, 30000, 100000),
+                       labels = c(1, 3, 10, 30, 100, 300, '1k', '3k', '10k', '30k', '100k')) +
+    theme_classic() +
+    theme(
+        axis.text = element_text(color = 'black'),
+        plot.margin = unit(c(0.2, 0.2, 0.2, 1), 'cm'),
+        axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1))
+f1a
+ggsave('figures/number_of_novel_orfs.pdf', width = 12, height = 3)
+ggsave('figures/number_of_novel_orfs2.pdf', width = 12, height = 5)
+```
+
+ORF type distributions
+```{r}
+plt <- ntg_orfs[, .N, by = .(lib, method, orf_type)]
+plt[, sample := symname[lib]]
+
+plt[, prop := N/sum(N), by = .(sample, method)]
+plt[, sample := factor(sample, levels = sort(unique(sample), decreasing = TRUE))]
+
+plt[, orf_type := fct_rev(orf_type)]
+plt <- plt[order(orf_type)]
+
+f1b <- ggplot(plt, aes(x = sample, y = prop, fill = orf_type)) +
+    geom_col() +
+    scale_y_continuous(breaks = seq(0, 1, 0.2)) +
+    coord_flip() +
+    facet_wrap(~method, nrow = 1) +
+    scale_fill_manual(values = color_orftypes,
+                      guide=guide_legend(nrow = 1, reverse = TRUE)) +
+    theme_minimal(base_size = 11) +
+    labs(x = NULL, y = 'Proportion', fill = NULL) +
+    theme(axis.text = element_text(color = 'black'),
+          panel.spacing = unit(0.5, 'lines'),
+          legend.position = 'bottom')
+f1b
+ggsave('figures/number_of_novel_orfs_by_orf_type.pdf', width = 12, height = 4)
+
+plt[, total := sum(N), by = .(lib, method)]
+plt[, .(mean = mean(N/total), sd = sd(N/total)), by = .(method, orf_type)]
+```
+
+Start codon distributions
+```{r}
+plt <- ntg_orfs[, .N, by = .(lib, method, start_codon)]
+plt[, sample := symname[lib]]
+plt[, sample := fct_rev(factor(sample))]
+
+plt[, prop := N/sum(N), by = .(sample, method)]
+plt[, start_codon := fct_rev(start_codon)]
+
+f1c <- ggplot(plt, aes(x = sample, y = prop, fill = start_codon)) +
+    geom_col() +
+    scale_y_continuous(breaks = seq(0, 1, 0.2)) +
+    coord_flip() +
+    facet_wrap(~method, nrow = 1) +
+    scale_fill_manual(values = rev(color_starts),
+                      guide=guide_legend(nrow = 1, reverse = TRUE)) +
+    theme_minimal(base_size = 11) +
+    labs(x = NULL, y = 'Proportion', fill = NULL) +
+    theme(axis.text = element_text(color = 'black'),
+          panel.spacing = unit(0.5, 'lines'),
+          legend.position = 'bottom')
+f1c
+ggsave('figures/number_of_novel_orfs_by_start_codon.pdf', f1c, width = 12, height = 5)
+
+# check each ORF types
+plt <- ntg_orfs[orf_type %in% c('uORF'), .N, by = .(lib, method, start_codon)]
+plt[, sample := symname[lib]]
+plt[, sample := fct_rev(factor(sample))]
+
+plt[, prop := N/sum(N), by = .(sample, method)]
+plt[, start_codon := fct_rev(fct_collapse(start_codon, AUG = 'ATG', other_level = 'Near-cognate'))]
+
+ggplot(plt, aes(x = sample, y = prop, fill = start_codon)) +
+    geom_col() +
+    scale_y_continuous(breaks = seq(0, 1, 0.2)) +
+    coord_flip() +
+    facet_wrap(~method, nrow = 1) +
+    scale_fill_manual(values = rev(color_starts[1:2]),
+                      guide=guide_legend(nrow = 1, reverse = TRUE)) +
+    theme_minimal(base_size = 11) +
+    labs(x = NULL, y = 'Proportion', fill = NULL) +
+    theme(axis.text = element_text(color = 'black'),
+          panel.spacing = unit(0.5, 'lines'),
+          legend.position = 'bottom')
+ggsave('figures/number_of_novel_orfs_by_start_codon_uorf.pdf', f1c, width = 12, height = 5)
+```
+
+ORF Length distribution
+```{r}
+plt <- ntg_orfs[, .(med = median(orf_len)), by = .(lib, method, orf_type)]
+plt[, sample := symname[lib]]
+
+plt <- plt[order(sample, method, orf_type)]
+
+f1d <- ggplot(plt, aes(x = med, y = method)) +
+    geom_point(alpha = 0.5, position = position_jitter(height = 0.1), size = 2) +
+    facet_wrap(vars(orf_type), scales = 'free', ncol = 1) +
+    labs(x = 'ORF length (nt)', y = NULL)
+
+f1d
+ggsave('figures/orfs_length_boxplot.pdf', width = 3, height = 12)
+
+ggplot(plt, aes(y = med, x = method)) +
+    geom_line(aes(group = sample), alpha = 0.2) +
+    geom_boxplot() +
+    facet_wrap(vars(orf_type), scales = 'free', ncol = 3) +
+    coord_flip() +
+    labs(y = 'ORF length (nt)', x = NULL)
+ggsave('figures/orfs_length_boxplot2.pdf', width = 9, height = 6)
+```
+
+### Quant Score distribution
+RRS/FLOSS/PME
+```{r}
+get_cds <- function(xpath){
+    dtt <- fread(xpath)
+    dtt <- dtt[start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG')]
+    dtt[, uuid := glue_data(.SD, '{chrom}|{gstart}-{gend}|{orf_len}|{strand}')]
+    cds <- dtt[orf_type %in% c('CDS', 'N_extension', 'N_truncation')]
+    cds <- cds[psite_total >= 10 & psite_total / n_codon >= 0.5]
+    
+    # assign ORFs to a single transcript based on appris/tsl score
+    if(grepl('human', xpath)){
+        cds <- merge(cds, appris_tsl_human, by = c('gene_id', 'tx_name'))
+    }else{
+        cds <- merge(cds, appris_tsl_mouse, by = c('gene_id', 'tx_name'))
+    }
+    cds <- cds[order(gene_id, appris, tsl, tx_name)]
+    cds <- cds[!duplicated(uuid)]
+    
+    # merge cds that are in the same transcripts and have the same stop codon
+    # keep the most upstream best-tier start codons
+    cds[, start_tier := fct_collapse(
+        start_codon, AUG = 'ATG', SUG = c('CTG', 'GTG'),
+        UUG = 'TTG', other_level = 'other')]
+    cds <- cds[order(tx_name, tend, start_tier, tstart)]
+    cds <- unique(cds, by = c('tx_name', 'tend'))
+    return(cds)
+}
+
+case_cds <- get_cds('data/benchmark_ntg/human.iPSC.normal.RPF.r1.price_processed.merged.tsv')
+case_orfs <- get_ncorfs('data/benchmark_ntg/human.iPSC.normal.RPF.r1.price_processed.merged.tsv')
+case_orfs <- case_orfs[start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG')]
+
+case <- rbind(CDS = case_cds, ncORF = case_orfs, idcol = 'grp')
+
+# PME
+# uniformity: looks not as good as PME
+ggplot(case, aes(x = pme)) +
+    geom_density(aes(fill = grp), alpha = 0.6) +
+    scale_y_continuous(expand = expand_scale(add = c(0, 0.05), mult = 0),
+                       breaks = c(0, 2, 4)) +
+    scale_fill_brewer(palette = 'Set1') +
+    guides(fill = guide_legend(override.aes = list(alpha = 1))) +
+    labs(x = 'PME', y = 'Density', fill = NULL) +
+    theme(legend.position = c(0.02, 0.98), legend.justification = c(0, 1))
+ggsave('figures/example_PME_distribution.pdf', width = 4, height = 3)
+
+# FLOSS
+ggplot(case, aes(x = psite_total, y = floss)) +
+    geom_point(aes(color = grp), alpha = 0.2, size = 1, shape = 19) +
+    scale_x_log10(labels = scales::label_number(big.mark = ','),
+                  breaks = c(10, 100, 1000, 10000),
+                  limits = c(10, 50000)) +
+    scale_color_brewer(palette = 'Set1') +
+    geom_smooth(aes(y = floss_ubd), se = F, method = 'loess',
+                linetype = 2, color = 'black') +
+    labs(x = 'Number of RPFs (P-site)', y = 'FLOSS', color = NULL) +
+    guides(color = guide_legend(override.aes = list(alpha = 1))) +
+    theme(legend.position = c(0.98, 0.98),
+          legend.justification = c(1, 1))
+ggsave('figures/example_floss_distribution.pdf', width = 4, height = 3)
+
+# RRS
+ggplot(case, aes(x = n_codon, y = rrs)) +
+    geom_point(aes(color = grp), alpha = 0.2, size = 0.5, shape = 19) +
+    scale_x_log10(labels = scales::label_number(big.mark = ','),
+                  breaks = c(10, 100, 1000)) +
+    scale_y_log10(breaks = c(0.1, 1, 10, 100, 1000),
+                  labels = c(0.1, 1, 10, 100, 1000)) +
+    geom_hline(yintercept = 1, linetype = 2) +
+    scale_color_brewer(palette = 'Set1') +
+    labs(x = 'Number of codons', y = 'RRS', color = NULL) +
+    guides(color = guide_legend(override.aes = list(alpha = 1))) +
+    theme(legend.position = c(0.98, 0.02),
+          legend.justification = c(1, 0))
+ggsave('figures/example_RRS_distribution.pdf', width = 4, height = 3)
+
+# kozak seqlogo
+plot_seqlogo <- function(kozak){
+    kozak <- stri_c(stri_sub(kozak, from = 1, to = 6),
+                    stri_sub(kozak, from = 10, to = 10))
+    kozak <- stri_replace_all_fixed(kozak, 'T', 'U')
+    ggseqlogo(kozak) +
+        scale_x_continuous(breaks=1:7, labels = c(-6:-1, '+4'))
+}
+
+p0 <- plot_seqlogo(case_cds$kozak_seq[case_cds$orf_type == 'CDS']) +
+     annotate('text', x = 1, y = 0.56, hjust = 0, vjust = 1, label = 'CDS starts')
+
+p1 <- plot_seqlogo(case_orfs$kozak_seq[case_orfs$start_codon == 'ATG']) +
+    scale_y_continuous(limits = c(0, 0.3)) +
+    annotate('text', x = 1, y = 0.3, hjust = 0, vjust = 1, label = 'AUG ncORF')
+p2 <- plot_seqlogo(case_orfs$kozak_seq[case_orfs$start_codon == 'CTG']) +
+    scale_y_continuous(limits = c(0, 0.3)) +
+    annotate('text', x = 1, y = 0.3, hjust = 0, vjust = 1, label = 'CUG ncORF')
+p3 <- plot_seqlogo(case_orfs$kozak_seq[case_orfs$start_codon == 'GTG']) +
+    scale_y_continuous(limits = c(0, 0.3)) +
+    annotate('text', x = 1, y = 0.3, hjust = 0, vjust = 1, label = 'GUG ncORF')
+p4 <- plot_seqlogo(case_orfs$kozak_seq[case_orfs$start_codon == 'TTG']) +
+    scale_y_continuous(limits = c(0, 0.3)) +
+    annotate('text', x = 1, y = 0.3, hjust = 0, vjust = 1, label = 'UUG ncORF')
+
+p0 | (p1 | p2) / (p3 | p4)
+ggsave('figures/example_kozak_seqlogo_distribution.pdf', width = 8, height = 4)
+```
+
+Summarize all samples
+```{r}
+plt <- ntg_orfs[, .(
+    total = .N,
+    pme_med = median(pme, na.rm = TRUE),
+    floss_fine = sum(floss < floss_ubd),
+    rrs_fine = sum(rrs > 1, na.rm = TRUE),
+    kozak_fine = sum((stri_sub(kozak_seq, 4, 4) %in% c('A', 'G')) &
+                         (stri_sub(kozak_seq, 10, 10) == 'G'))
+), by = .(method, lib, orf_type)]
+plt[, `:=`(floss_prop = floss_fine/total, rrs_prop = rrs_fine/total, kozak_prop = kozak_fine/total)]
+
+# median PME across different samples
+p <- ggplot(plt[total >= 10], aes(x = method, y = pme_med, fill = method)) +
+    geom_boxplot(show.legend = FALSE) +
+    scale_fill_brewer(palette = 'Dark2') +
+    labs(x = NULL, y = 'Median PME')
+
+p + facet_grid(rows = vars(orf_type)) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+ggsave('figures/overall_pme_distribution.pdf', width = 3, height = 10)
+
+p + facet_grid(cols = vars(orf_type)) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+ggsave('figures/overall_pme_distribution2.pdf', width = 10, height = 3)
+
+# fraction of ORFs that are not floss outliers
+p <- ggplot(plt[total >= 10], aes(x = method, y = floss_prop, fill = method)) +
+    geom_boxplot(show.legend = FALSE) +
+    scale_y_continuous(labels = scales::percent) +
+    scale_fill_brewer(palette = 'Dark2') +
+    labs(x = NULL, y = 'Non-outliers by FLOSS')
+
+p + facet_grid(rows = vars(orf_type), scales = 'free_y') +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+ggsave('figures/overall_floss_distribution.pdf', width = 3, height = 10)
+
+p + facet_grid(cols = vars(orf_type), scales = 'free_y') +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+ggsave('figures/overall_floss_distribution2.pdf', width = 10, height = 3)
+
+# ORFs with RRS > 1
+p <- ggplot(plt[total >= 10], aes(x = method, y = rrs_prop, fill = method)) +
+    geom_boxplot(show.legend = FALSE) +
+    scale_y_continuous(labels = scales::percent) +
+    scale_fill_brewer(palette = 'Dark2') +
+    labs(x = NULL, y = 'ORFs with RRS > 1')
+
+p + facet_grid(rows = vars(orf_type), scales = 'free_y') +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+ggsave('figures/overall_RRS_distribution.pdf', width = 3, height = 10)
+
+p + facet_grid(cols = vars(orf_type), scales = 'free_y') +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+ggsave('figures/overall_RRS_distribution2.pdf', width = 10, height = 3)
+
+# ORFs with optimal kozak sequence context
+p <- ggplot(plt[total >= 10], aes(x = method, y = kozak_prop, fill = method)) +
+    geom_boxplot(show.legend = FALSE) +
+    scale_fill_brewer(palette = 'Dark2') +
+    scale_y_continuous(labels = scales::percent) +
+    labs(x = NULL, y = 'ORFs with optimal Kozak')
+
+p + facet_grid(rows = vars(orf_type), scales = 'free_y') +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+ggsave('figures/overall_kozak_distribution.pdf', width = 3, height = 10)
+
+p + facet_grid(cols = vars(orf_type), scales = 'free_y') +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+ggsave('figures/overall_kozak_distribution2.pdf', width = 10, height = 3)
+```
+
+Distribution of Translation efficiency
+```{r}
+# example
+plt <- ntg_orfs[, .(lib, method, uuid, uid, orf_type, psite_total, n_codon)][
+    order(method, psite_total/n_codon)]
+plt <- unique(plt, by = c('lib', 'method', 'uid'))
+plt[, libname := symname[lib]]
+plt[, libname := factor(libname, levels = symname)]
+
+ggplot(plt[!orf_type %in% c('uoORF', 'iORF', 'doORF')],
+       aes(x = psite_total/n_codon, color = method)) +
+    stat_ecdf() +
+    scale_x_log10(expand = expansion(mult = c(0, 0.05))) +
+    scale_color_brewer(palette = 'Dark2') +
+    labs(x = 'Translation efficiency (P-sites per codon)',
+         y = 'ECDF', color = NULL) +
+    coord_cartesian(xlim = c(0.5, 100)) +
+    facet_wrap(vars(libname), scales = 'free') +
+    theme(legend.position = c(0.98, 0.02), legend.justification = c(1, 0))
+ggsave('figures/overall_translation_efficiency_distribution.pdf', width = 10, height = 10)
+```
+
+
+### Accuracy
+
+#### TI-Seq data coverage
+```{r}
+# example distribution
+get_tiscov <- function(path_cov, path_orfs){
+    dtt_cov <- fread(path_cov)
+    dtt_cov[, c('tstart', 'tend') := NULL]
+    
+    dtt_orfs <- get_ncorfs(path_orfs)
+    dtt_orfs <- dtt_orfs[start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG')]
+    dtt_cds <- get_cds(path_orfs)
+    
+    bycols <- c('orf_id', 'tx_name')
+    cov_orfs <- merge(dtt_cov, dtt_orfs[, ..bycols], by = bycols)
+    cov_cds <- merge(dtt_cov, dtt_cds[, ..bycols], by = bycols)
+    return(list(orfs = cov_orfs, cds = cov_cds))
+}
+
+case_cov <- get_tiscov(
+    'data/benchmark_ntg_tiscov/human.iPSC.normal.RPF.r1.price_processed.cov_HTN.tsv',
+    'data/benchmark_ntg/human.iPSC.normal.RPF.r1.price_processed.merged.tsv')
+case_cds_cov <- copy(case_cov$cds)
+case_orfs_cov <- copy(case_cov$orfs)
+
+plt <- rbind(ncORF = data.table(stack(colSums(case_orfs_cov[, u5:d5], na.rm = TRUE))),
+             CDS = stack(colSums(case_cds_cov[, u5:d5], na.rm = TRUE)), idcol = 'grp')
+setnames(plt, c('grp', 'psites', 'index'))
+plt[, prop := psites/sum(psites), by = .(grp)]
+
+ggplot(plt, aes(x = index, y = prop, color = grp, group = grp)) +
+    geom_line(size = 1) +
+    scale_color_brewer(palette = 'Set1') +
+    scale_x_discrete(breaks = unique(plt$index), labels = -5:5) +
+    labs(x = NULL, y = 'Fraction of P-sites', color = NULL) +
+    theme(legend.position = c(0.98, 0.98),
+          legend.justification = c(1, 1))
+ggsave('figures/example_tiscov_metagene_distribution.pdf', width = 4, height = 3)
+```
+
+#### TI-seq peak stat results
+```{r}
+# orf types
+plt <- ntg_orfs[, .(total = .N, peak = sum(tis_peak)), by = .(lib, method, orf_type)]
+
+ggplot(plt[total >= 10], aes(y = fct_rev(method), x = peak/total, fill = fct_rev(method))) +
+    geom_boxplot(show.legend = FALSE) +
+    scale_fill_brewer(palette = 'Dark2', direction = -1) +
+    scale_x_continuous(labels = scales::percent) +
+    facet_wrap(vars(orf_type), scales = 'free_x', nrow = 1) +
+    labs(x = 'ORFs with TI-Seq peaks', y = NULL) +
+    theme(panel.spacing.x = unit(1, 'line'))
+ggsave('figures/prop_orfs_with_tiseq_peaks.pdf', width = 12, height = 3)
+
+ggplot(plt[total >= 10], aes(x = method, y = peak/total, fill = method)) +
+    geom_boxplot(show.legend = FALSE) +
+    coord_cartesian(ylim = c(0, 0.3)) +
+    scale_fill_brewer(palette = 'Dark2') +
+    scale_y_continuous(labels = scales::percent) +
+    labs(y = 'ORFs with TI-Seq peaks', x = NULL) +
+    theme(panel.spacing.x = unit(1, 'line'),
+          axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+    facet_wrap(vars(orf_type), scales = 'free_x', nrow = 1)
+ggsave('figures/prop_orfs_with_tiseq_peaks2.pdf', width = 12, height = 4)
+
+# start codons
+plt <- ntg_orfs[, .(total = .N, peak = sum(tis_peak)), by = .(lib, method, start_codon)]
+
+ggplot(plt[total >= 10], aes(x = method, y = peak/total, fill = method)) +
+    geom_boxplot(show.legend = FALSE) +
+    coord_cartesian(ylim = c(0, 0.25)) +
+    facet_grid(cols = vars(start_codon)) +
+    scale_fill_brewer(palette = 'Dark2') +
+    scale_y_continuous(labels = scales::percent) +
+    labs(y = 'ORFs with TI-Seq peaks', x = NULL) +
+    theme(panel.spacing.x = unit(1, 'line'),
+          axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+ggsave('figures/prop_orfs_with_tiseq_peaks_groupby_start.pdf', width = 10, height = 4)
+```
+
+#### Read and filter MS-detected ORFs
+```{r}
+# raw MS ORFs
+msorfs <- fread('data/human_mouse_orfs_with_ms_evidence_LTY20230216.tsv')
+msorfs[, c('phase_start', 'phase_end', 'cds_start_nf', 'cds_end_nf', 'mrna_start_nf',
+           'mrna_end_nf', 'dna_seq', 'aa_seq', 'stop_codon', 'n_stop') := NULL]
+msorfs[orf_type == 'wORF', orf_type := 'uoORF']
+msorfs[, uid :=  glue_data(.SD, '{str_sub(study, 1, 3)}_{chrom}_{gend}{strand}')]
+msorfs[, species := ifelse(str_sub(study, 1, 3) == 'hsa', 'human', 'mouse')]
+msorfs[, uuid := glue_data(.SD, '{str_sub(study, 1, 3)}_{chrom}_{gstart}_{gend}_{orf_len}{strand}')]
+# no uuid collision between human & mouse
+
+# correct names
+msorfs[, study := str_replace(study, 'Mackowiak', 'Mackowiak2015')]
+
+# exclude CDS or CDS variants, keep representative ORFs on prioritized transcripts and merge
+tmp <- msorfs[orf_type %in% c('CDS', 'C_extension', 'C_truncation',
+    'N_extension', 'N_truncation', 'sCDS', 'iCDS', 'wCDS')]
+msorfs_final <- msorfs[!uid %in% tmp$uid]
+# we do not analyze ORFs in other types of ncRNAs and pseudogenes
+msorfs_final <- msorfs_final[!orf_type %in% c('ncRNA-ORF', 'pseudogene-ORF')]
+
+msorfs_final <- rbind(merge(msorfs_final, appris_tsl_human, by = c('gene_id', 'tx_name')),
+                      merge(msorfs_final, appris_tsl_mouse, by = c('gene_id', 'tx_name')))
+msorfs_final <- msorfs_final[order(gene_id, appris, tsl, tx_name)]
+msorfs_final <- unique(msorfs_final, by = c('species', 'uuid'))
+
+# exclude non-NTG start codons
+msorfs_final[, start_tier := fct_collapse(
+    start_codon, AUG = 'ATG', SUG = c('CTG', 'GTG'),
+    UUG = 'TTG', other_level = 'other')]
+msorfs_final[, table(start_tier)]
+#   AUG   SUG   UUG other 
+#  2868  1263   365   555
+msorfs_final <- msorfs_final[start_tier != 'other']
+
+# merge ORFs on the same isoform and have the same transcript end sites
+msorfs_final <- msorfs_final[order(tx_name, tend, start_tier, tstart)]
+msorfs_final <- unique(msorfs_final, by = c('species', 'tx_name', 'tend'))
+
+msorfs_final[, table(species)]
+msorfs_final[, .N, keyby = .(species, start_codon)]
+fwrite(msorfs_final, 'results/human_mouse_orfs_with_ms_evidence_LTY_clean.tsv', sep = '\t')
+
+msorfs_final[, table(species)]
+
+msorfs_final[, .N, by = .(species, orf_type)][order(species, -N)]
+
+msorfs_final[, .N, by = .(species, start_codon)][order(species, -N)]
+
+
+plt <- msorfs[uid %in% msorfs_final$uid]
+plt <- plt[, .(num = uniqueN(uid)), by = .(species, study)]
+plt[, study2 := str_replace(study, r'((hsa|mmu)_(.*\d{4})_.*$)', r'(\2)')]
+plt <- plt[order(species, -num, decreasing = TRUE)]
+plt[, study2 := fct_inorder(study2)]
+
+ggplot(plt, aes(x = num, y = study2, fill = species)) +
+    geom_col(show.legend = FALSE, width = 0.618) +
+    geom_text(aes(label = num), hjust = 0) +
+    scale_fill_manual(values = color_species) +
+    scale_x_log10(expand = expand_scale(mult = c(0, 0.1))) +
+    labs(x = 'Number of ORFs with MS evidence', y = NULL) +
+    facet_wrap(facets = vars(str_to_title(species)), scales = 'free')
+ggsave('figures/orfs_with_ms_evidence_per_study.pdf', width = 10, height = 4)
+```
+
+Add a column indicating whether an ORF uid has ms evidence support
+```{r}
+ntg_orfs[, ms := uid %in% msorfs_final$uid]
+
+# ORF types (human & mouse, ATG only)
+plt <- ntg_orfs[start_codon == 'ATG', .(total = .N, wms = sum(ms)), by = .(lib, method, orf_type)]
+
+ggplot(plt[total >= 10], aes(y = fct_rev(method), x = wms/total, fill = fct_rev(method))) +
+    geom_boxplot(show.legend = FALSE) +
+    scale_fill_brewer(palette = 'Dark2', direction = -1) +
+    scale_x_continuous(labels = scales::percent) +
+    facet_wrap(vars(orf_type), scales = 'free_x', nrow = 1) +
+    labs(x = 'MS-detected ORFs', y = NULL) +
+    theme(panel.spacing.x = unit(1, 'line'))
+ggsave('figures/prop_orfs_with_ms_atg.pdf', width = 12, height = 3)
+
+ggplot(plt[total >= 10], aes(x = method, y = wms/total, fill = method)) +
+    geom_boxplot(show.legend = FALSE) +
+    # geom_line(aes(group = lib), alpha = 0.2) +
+    scale_fill_brewer(palette = 'Dark2') +
+    scale_y_continuous(labels = scales::percent) +
+    facet_wrap(vars(orf_type), scales = 'free_x', nrow = 1) +
+    labs(x = NULL, y = 'MS-detected ORFs') +
+    theme(panel.spacing.x = unit(1, 'line'),
+          axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+ggsave('figures/prop_orfs_with_ms_atg2.pdf', width = 12, height = 4)
+
+# ORF types (mouse only, ATG)
+plt <- ntg_orfs[str_starts(lib, 'mouse') & start_codon == 'ATG',
+                .(total = .N, wms = sum(ms)), by = .(lib, method, orf_type)]
+ggplot(plt[total >= 10], aes(x = method, y = wms/total, fill = method)) +
+    geom_boxplot(show.legend = FALSE) +
+    scale_fill_brewer(palette = 'Dark2') +
+    scale_y_continuous(labels = scales::percent) +
+    facet_wrap(vars(orf_type), scales = 'free_x', nrow = 1) +
+    labs(x = NULL, y = 'MS-detected ORFs') +
+    theme(panel.spacing.x = unit(1, 'line'),
+          axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+ggsave('figures/prop_orfs_with_ms_atg_mouse.pdf', width = 12, height = 4)
+
+# ORF types (human only)
+plt <- ntg_orfs[str_starts(lib, 'human'),
+                .(total = .N, wms = sum(ms)), by = .(lib, method, orf_type)]
+ggplot(plt[total >= 10], aes(x = method, y = wms/total, fill = method)) +
+    geom_boxplot(show.legend = FALSE) +
+    scale_fill_brewer(palette = 'Dark2') +
+    scale_y_continuous(labels = scales::percent) +
+    facet_wrap(vars(orf_type), scales = 'free_x', nrow = 1) +
+    labs(x = NULL, y = 'MS-detected ORFs') +
+    theme(panel.spacing.x = unit(1, 'line'),
+          axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+ggsave('figures/prop_orfs_with_ms_ntg_human.pdf', width = 12, height = 4)
+
+# ORF types (human non-AUG only)
+plt <- ntg_orfs[str_starts(lib, 'human') & start_codon != 'ATG',
+                .(total = .N, wms = sum(ms)), by = .(lib, method, orf_type)]
+ggplot(plt[total >= 10], aes(x = method, y = wms/total, fill = method)) +
+    geom_boxplot(show.legend = FALSE) +
+    scale_fill_brewer(palette = 'Dark2') +
+    scale_y_continuous(labels = scales::percent) +
+    facet_wrap(vars(orf_type), scales = 'free_x', nrow = 1) +
+    labs(x = NULL, y = 'MS-detected ORFs') +
+    theme(panel.spacing.x = unit(1, 'line'),
+          axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+ggsave('figures/prop_orfs_with_ms_nonatg_human.pdf', width = 12, height = 4)
+
+# start codons
+# only test human, since ms ORFs in mouse are biased to ATG ones
+plt <- ntg_orfs[, .(total = .N, wms = sum(ms)), by = .(lib, method, start_codon)]
+plt <- plt[str_starts(lib, 'human')]
+
+ggplot(plt[total >= 10], aes(x = method, y = wms/total, fill = method)) +
+    geom_boxplot(show.legend = FALSE) +
+    scale_fill_brewer(palette = 'Dark2') +
+    scale_y_continuous(labels = scales::percent) +
+    facet_grid(cols = vars(start_codon)) +
+    labs(y = 'MS-detected ORFs', x = NULL) +
+    theme(panel.spacing.x = unit(1, 'line'),
+          axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+ggsave('figures/prop_orfs_with_ms_groupby_start.pdf', width = 10, height = 4)
+```
+
+#### Start codon Accuracy vs transcript complexity
+Calculate gene model complexity (GMC) by the number of transcript isoforms
+```{r}
+gcomp_human <- txinfo_human[, .(gmc = .N), by = .(gene_id, gene_biotype)]
+gcomp_mouse <- txinfo_mouse[, .(gmc = .N), by = .(gene_id, gene_biotype)]
+gcomp <- rbind(human = gcomp_human,  mouse = gcomp_mouse, idcol = 'species')
+
+ggplot(gcomp[gmc <= 30], aes(x = gmc, fill = species)) +
+    geom_histogram(position = 'identity', alpha = 0.6)
+
+x <- gcomp[gene_biotype == 'protein_coding', table(gmc)]
+cumsum(x/sum(x))
+# about ~50% protein-coding genes have >= 5 transcript isoforms. 5 can
+# serve as a good cutoff for complex transcripts
+
+gcomp[, gmc_type := ifelse(gmc >= 5, 'Complex', 'Simple')]
+ntg_orfs[gcomp, gmc_type := i.gmc_type, on = .(gene_id)]
+```
+
+```{r}
+plt <- ntg_orfs[, .(total = .N, peak = sum(tis_peak)), by = .(lib, method, orf_type, gmc_type)]
+
+# ORFs with TI-seq peaks
+ggplot(plt[total >= 10], aes(x = method, y = peak/total, fill = gmc_type)) +
+    geom_boxplot() +
+    # coord_cartesian(ylim = c(0, 0.25)) +
+    facet_grid(cols = vars(orf_type)) +
+    scale_fill_brewer(palette = 'Dark2') +
+    scale_y_continuous(labels = scales::percent) +
+    labs(y = 'ORFs with TI-Seq peaks', x = NULL, fill = NULL) +
+    theme(panel.spacing.x = unit(1, 'line'),
+          axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1))
+ggsave('figures/gene_model_complexity_vs_accoracy_tiseq.pdf', width = 12, height = 4)
+
+# MS-detected ORFs
+plt <- ntg_orfs[, .(total = .N, ms = sum(ms)), by = .(lib, method, orf_type, gmc_type)]
+ggplot(plt[total >= 10], aes(x = method, y = ms/total, fill = gmc_type)) +
+    geom_boxplot() +
+    facet_grid(cols = vars(orf_type)) +
+    scale_fill_brewer(palette = 'Dark2') +
+    scale_y_continuous(labels = scales::percent) +
+    labs(y = 'ORFs with TI-Seq peaks', x = NULL, fill = NULL) +
+    theme(panel.spacing.x = unit(1, 'line'),
+          axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1))
+# no obvious trend observed
+```
+
+### Reproducibility
+example venn diagram
+```{r}
+plot_venn <- function(m, s, id){
+    s <- str_subset(unique(ntg_orfs$lib), s)
+    dtt <- ntg_orfs[method == m & lib %in% s]
+    
+    uids <- split(dtt[[id]], f = dtt$lib)
+    names(uids) <- sub('.*\\.', '', names(uids))
+    names(uids) <- str_replace(names(uids), r'(.*\.)', '')
+    uids <- lapply(uids, unique)
+
+    plot(euler(uids), #quantities = TRUE,
+         main = list(label = m, fontsize = 11),
+         labels = list(fontsize = 12),
+         quantities = list(fontsize = 11))
+}
+
+# testing
+plot_venn('PRICE', 'human.iPSC.normal.RPF', 'uid')
+
+# plot
+x <- sort(unique(ntg_orfs$method))
+p <- lapply(x, plot_venn, 'human.iPSC.normal.RPF', 'uid')
+Reduce('+', lapply(p, wrap_elements)) + plot_layout(nrow = 1)
+ggsave('figures/ncorf_overlap_venn_iPSC.pdf', width = 12, height = 3)
+
+x <- sort(unique(ntg_orfs$method))
+p <- lapply(x, plot_venn, 'human.iCM.normal.RPF', 'uid')
+Reduce('+', lapply(p, wrap_elements)) + plot_layout(nrow = 1)
+ggsave('figures/ncorf_overlap_venn_iCM.pdf', width = 12, height = 3)
+```
+
+calculate Jaccard similarity index
+```{r}
+#' calculate Jaccard index between two sets
+jaccard <- function(x, y){
+    x <- unique(x)
+    y <- unique(y)
+    length(intersect(x, y))/length(union(x, y))
+}
+
+#' calculate average pairwise Jaccard index between three or more sets
+jaccard2 <- function(x){
+    j <- combn(x, 2, function(s){
+        jaccard(s[[1]], s[[2]])
+    })
+    mean(j)
+}
+
+rank_id <- function(x){
+    as.numeric(factor(x, levels = unique(x)))
+}
+
+plt <- ntg_orfs[str_detect(lib, 'human.iCM.normal.RPF')]
+x <- min(plt[, .N, by = .(method, lib)]$N)  # 2082
+plt <- plt[order(lib, method, -psite_total/n_codon)]
+plt[, uid_rank := rank_id(uid), by = .(lib, method)]
+plt <- plt[uid_rank <= x]
+plt1 <- plt[, .(jaccard = jaccard2(split(uid, f = lib))), by = .(method)][base::order(method)]
+
+plt <- ntg_orfs[str_detect(lib, 'human.iPSC.normal.RPF')]
+x <- min(plt[, .N, by = .(method, lib)]$N)  # 2082
+plt <- plt[order(lib, method, -psite_total/n_codon)]
+plt[, uid_rank := rank_id(uid), by = .(lib, method)]
+plt <- plt[uid_rank <= x]
+plt2 <- plt[, .(jaccard = jaccard2(split(uid, f = lib))), by = .(method)][base::order(method)]
+
+
+plt <- rbind(iCM = plt1, iPSC = plt2, idcol = 'sample')
+
+ggplot(plt, aes(x = jaccard, y = fct_rev(method), fill = sample)) +
+    geom_col(position = 'dodge') +
+    labs(x = 'Jaccard index', y = NULL, fill = NULL) +
+    scale_x_continuous(expand = expansion(mult = c(0, 0.05))) +
+    scale_fill_brewer(palette = 'Accent') +
+    theme(legend.position = c(0.98, 0.98),
+          legend.justification = c(1, 1)) +
+    guides(fill = guide_legend(nrow = 1))
+ggsave('figures/reproducibility_iCM_iPSC.pdf', width = 4, height = 3)
+
+```
+
+### Effects of replicates and ensemble on accuracy
+
+#### Overlap between splits
+```{r}
+# duplicated ORFs predicted from two random splits (i.e., pseudo-replicates)
+orfs_prep <- fread('data/benchmark_ntg_split_duplicated_id.tsv')
+setnames(orfs_prep, 'library', 'lib')
+orfs_prep <- orfs_prep[lib %in% unique(ntg_orfs$lib)]
+orfs_prep[, uid := str_c(ifelse(str_detect(lib, 'human'), 'hsa_', 'mmu_'), uid)]
+orfs_prep[, uid := str_replace(uid, '_([+-])$', '\\1')]
+table(orfs_prep$uid %in% ntg_orfs$uid)
+
+ntg_orfs[orfs_prep, split_dup := 'Dup', on = .(lib, method, uid)]
+ntg_orfs[is.na(split_dup), split_dup := 'Not']
+
+# evaluate
+plt1 <- unique(ntg_orfs[start_codon == 'ATG' | str_starts(lib, 'human')][order(!ms)],
+               by = c('lib', 'method', 'uid'))[
+    , .(total = .N, ms = sum(ms)), by = .(lib, method, split_dup)]
+plt1[, `:=`(prop = ms / total)]
+plt1[, libname := fct_rev(symname[lib])]
+
+ggplot(plt1, aes(y = libname, x = prop, fill = split_dup)) +
+    geom_col(position = 'dodge') +
+    scale_fill_brewer(palette = 'Set1') +
+    scale_x_continuous(labels = scales::percent) +
+    labs(x = 'MS-detected ORFs', y = NULL, fill = NULL) +
+    facet_grid(cols = vars(method), scales = 'free')
+ggsave('figures/splitdup_orfs_ms_detected.pdf', width = 12, height = 6)
+
+dcast(plt1, lib + method ~ split_dup, value.var = 'prop')[
+    , wilcox.test(Dup, Not, paired = TRUE, alternative = 'greater')$p.value, by = .(method)]
+
+ggplot(plt1[str_detect(libname, 'Human')], aes(y = libname, x = prop, fill = split_dup)) +
+    geom_col(position = 'dodge') +
+    scale_fill_brewer(palette = 'Set1') +
+    scale_x_continuous(labels = scales::percent) +
+    labs(x = 'MS-detected ORFs', y = NULL, fill = NULL) +
+    facet_grid(cols = vars(method), scales = 'free')
+ggsave('figures/splitdup_orfs_ms_detected_human.pdf', width = 12, height = 3)
+
+dcast(plt1[str_detect(libname, 'Human')], lib + method ~ split_dup, value.var = 'prop')[
+    , wilcox.test(Dup, Not, paired = TRUE, alternative = 'greater')$p.value, by = .(method)]
+
+plt2 <- unique(ntg_orfs[order(!tis_peak)], by = c('lib', 'method', 'uid'))[
+    , .(total = .N, peak = sum(tis_peak)), by = .(lib, method, split_dup)]
+plt2[, `:=`(prop = peak / total)]
+plt2[, libname := fct_rev(symname[lib])]
+
+ggplot(plt2, aes(y = libname, x = prop, fill = split_dup)) +
+    geom_col(position = 'dodge') +
+    scale_fill_brewer(palette = 'Set1') +
+    scale_x_continuous(labels = scales::percent) +
+    labs(x = 'ORFs with TI-Seq peaks', y = NULL, fill = NULL) +
+    facet_grid(cols = vars(method), scales = 'free')
+ggsave('figures/splitdup_orfs_tiseq_peaks.pdf', width = 12, height = 6)
+
+dcast(plt2, lib + method ~ split_dup, value.var = 'prop')[
+    , wilcox.test(Dup, Not, paired = TRUE, alternative = 'greater')$p.value, by = .(method)]
+```
+
+#### Overlap between different methods in the same sample
+Number of times an ORF was detected by different methods
+```{r}
+# attach detection method count
+ntg_orfs[, detect_mcnt := uniqueN(method), by = .(lib, uid)]
+```
+
+```{r}
+plt <- ntg_orfs[, .(num = uniqueN(uid)), by = .(lib, method, detect_mcnt)]
+plt[, libname := factor(symname[lib], levels = rev(symname))]
+
+ggplot(plt, aes(x = num, y = libname, fill = factor(detect_mcnt))) +
+    geom_col(position = 'fill') +
+    geom_vline(xintercept = c(0.25, 0.5), linetype = 2) +
+    scale_fill_brewer(palette = 'Blues') +
+    facet_wrap(vars(method), nrow = 1) +
+    labs(x = 'Proportion of ORFs', y = NULL, fill = '# methods') +
+    theme(panel.spacing.x = unit(1, 'line'))
+ggsave('figures/overlap_among_methods_perlib.pdf', width = 12, height = 4)
+```
+
+#### ORFs detected by at least two different methods are more accurate?
+```{r}
+plt1 <- unique(ntg_orfs[start_codon == 'ATG' | str_starts(lib, 'human')][order(!ms)], by = c('lib', 'uid'))[
+    , .(total = .N, ms = sum(ms)), by = .(lib, mcnt = detect_mcnt >= 3)]
+plt1[, `:=`(prop = ms / total)]
+plt1[, libname := symname[lib]]
+
+ggplot(plt1, aes(x = libname, y = prop, fill = mcnt)) +
+    geom_col(position = 'dodge') +
+    scale_fill_brewer(palette = 'Set1', breaks = c(F, T),
+                      labels = c(expression(''<3), expression(''>=3))) +
+    scale_y_continuous(labels = scales::percent) +
+    labs(y = 'MS-detected ORFs', x = NULL, fill = '# methods') +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+plt2 <- unique(ntg_orfs[order(!tis_peak)], by = c('lib', 'uid'))[
+    , .(total = .N, peak = sum(tis_peak)), by = .(lib, mcnt = detect_mcnt >= 3)]
+plt2[, `:=`(prop = peak / total)]
+plt2[, libname := symname[lib]]
+
+ggplot(plt2, aes(x = libname, y = prop, fill = mcnt)) +
+    geom_col(position = 'dodge') +
+    scale_fill_brewer(palette = 'Set1', breaks = c(F, T),
+                      labels = c(expression(''<3), expression(''>=3))) +
+    scale_y_continuous(labels = scales::percent) +
+    labs(y = 'ORFs with TI-Seq peaks', x = NULL, fill = '# methods') +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+
+plt <- rbind('MS-detected ORFs' = plt1[, !'ms'],
+             'ORFs with TI-Seq peaks' = plt2[, !'peak'], idcol = 'grp')
+plt[, mcnt := factor(mcnt, levels = c(F, T), labels = c('<3', '>=3'))]
+plt[, species := str_remove(libname, ' .*')]
+plt[, libname := fct_rev(str_remove(libname, '(Human|Mouse) '))]
+
+
+ggplot(plt, aes(y = libname, x = prop, fill = mcnt)) +
+    geom_col(position = 'dodge') +
+    scale_fill_brewer(palette = 'Set1') +
+    scale_x_continuous(labels = scales::percent) +
+    labs(x = NULL, y = NULL, fill = '# methods') +
+    facet_wrap(vars(species, grp), scales = 'free') +
+    guides(fill = guide_legend(reverse = T))
+ggsave('figures/orfs_detected_by_multiple_methods_ms_tiseq.pdf', width = 8, height = 5)
+```

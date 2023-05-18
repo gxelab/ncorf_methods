@@ -1,0 +1,1045 @@
+# Get the bed12 file of MS data from the original data
+
+```{r}
+library(readxl)
+library(tidyverse)
+library(Biostrings)
+```
+
+## Human
+### hsa_Chothani2022_MC
+```{r}
+sonia_gtf <- read_tsv('data/Sonia_2022_MolCell_smORF_7767.gtf', col_names = FALSE)
+
+sonia_bed12 <- sonia_gtf |>
+  filter(X3 == 'orfCDS') |>
+  mutate(orf_id = sub(r'{.* iORF_id "(.*?)".*}', r'{\1}', X9)) |>
+  arrange(orf_id, X1, X4) |>
+  group_by(orf_id) %>%
+  summarize(chrom = X1[1],
+            chromStart = min(X4) - 1,
+            chromEnd = max(X5),
+            name = orf_id[1],
+            score = 0,
+            strand = X7[1],
+            thickStart = chromStart,
+            thickEnd = chromEnd,
+            itemRgb = 0,
+            blockCount = n(),
+            blockSizes = str_c(X5 - X4 + 1, collapse = ','),
+            bloockStarts = str_c(X4 - X4[1], collapse = ','), .groups = 'drop') |> 
+  mutate(across(c(chromStart, chromEnd, score, thickStart, thickEnd), as.integer)) |> 
+  select(-orf_id)
+
+human_MS_cell <- read_xlsx('data/MS_data/human_cell_MS_data.xlsx', sheet = 1, col_names = F)|>
+  distinct(...11)
+
+human_MS_cell_bed12 <- sonia_bed12 |> filter(name %in% human_MS_cell$...11)
+
+write_tsv(human_MS_cell_bed12, file = 'data/human_MS_cell.bed12', col_names = F)
+```
+
+### hsa_Mudge2022_NB
+```{r}
+human_MS_roadmap_1 <- read_xlsx('data/MS_data/human_roadmap_MS.xlsx', sheet = 3) |>
+  filter(number_studies_MS > 0) |>
+  select(chrm, starts, ends, strand, transcript, gene_id, gene_name, orf_biotype)
+human_MS_roadmap_2 <- read_xlsx('data/MS_data/human_roadmap_MS.xlsx', sheet = 4)|>
+  filter(number_studies_MS > 0) |>
+  select(chrm, starts, ends, strand, transcript, gene_id, gene_name, orf_biotype)
+human_MS_roadmap <- rbind(human_MS_roadmap_1, human_MS_roadmap_2)
+
+human_MS_roadmap_bed6 <- human_MS_roadmap |>
+  separate(starts, into = letters[1:4], sep = ";") |>
+  pivot_longer(a:d, names_to = 'n_start', values_to = 'start') |>
+  separate(ends, into = letters[1:4], sep = ";") |>
+  pivot_longer(a:d, names_to = 'n_end', values_to = 'end') |>
+  filter(!is.na(start) & !is.na(end) & n_start == n_end) |>
+  mutate(chrm = paste0('chr', chrm), 
+         orf_id = paste(transcript, gene_id, orf_biotype, sep = '_'), 
+         value = 0, start = as.integer(start) - 1) |> 
+  select(chrm, start, end, orf_id, value, strand)
+
+#### bed6tobed12
+human_MS_roadmap_bed12 <- human_MS_roadmap_bed6 |>
+  group_by(orf_id) |>
+  mutate(start = as.integer(start), end = as.integer(end)) |>
+  mutate(bed1 = chrm, bed2 = min(start), bed3 = max(end), bed4 = orf_id, bed5 = value, bed6 = strand, 
+         bed7 = 0, bed8 = 0, bed9 = 0, bed10 = length(chrm), 
+         block_len = end - start, block_start = start - bed2) |>
+  select(-c(chrm, start, end, value, strand)) |>
+  mutate(bed11 = paste(block_len, collapse = ','), 
+         bed12 = paste(block_start, collapse = ',')) |>
+  slice_min(block_start, n = 1) |>
+  ungroup() |>
+  select(-c(block_len, block_start, orf_id))
+
+write_tsv(human_MS_roadmap_bed12, 'data/human_MS_roadmap.bed12', col_names = F)  
+```
+
+### hsa_Ruiz2021_CR
+```{r}
+human_CellRep <- read_csv('data/MS_data/Immunopeptidome/DoHH2/protein_origin_DOHH2_Non_Canonical.csv')
+
+human_CellRep_bed12 <- human_CellRep |>
+  separate(Protein, into = c(NA, 'start_position'), sep = '-(?=chr)', remove = F) |>
+  separate(start_position, into = c('chrom', 'start', 'end', 'strand'), sep = ':|(?<=[0-9])-') |>
+  select(chrom, start, end, strand, orf_id = Protein, tx_position = 'Range_transcript') |> 
+  separate(tx_position, into = c('tx_chrom', 'tx_position'), sep = ':') |>
+  separate_longer_delim(tx_position, delim = '|') |>
+  separate(tx_position, into = c('tx_start', 'tx_end'), sep = '-') |>
+  mutate(across(c(tx_start, tx_end), as.integer), 
+         tx_start = tx_start - 1)|>
+  group_by(orf_id, chrom, start, end, strand) |>
+  arrange(tx_start, .by_group = TRUE) |>
+  summarise(
+            chrom_tx = tx_chrom[1],
+            start_tx = tx_start[1],
+            end_tx = last(tx_end),
+            name_tx = orf_id[1],
+            score_tx = 0,
+            strand_tx = strand[1],
+            thickStart_tx = 0,
+            thickEnd_tx = 0,
+            itemRgb_tx = '255,0,0',
+            blockCount_tx = n(),
+            blockSize_tx = str_c(tx_end - tx_start, collapse = ','),
+            blockStarts_tx = str_c(tx_start - start_tx, collapse = ",")
+  ) |>
+    ungroup() |>
+    select(-c(orf_id, chrom, start, end, strand))
+write_tsv(human_CellRep_bed12, file = 'data/human_MS_CellRep.bed12', col_names = F)
+
+```
+
+## Mouse
+### MCP_yang_2023
+```{r}
+mouse_01_S2 <- read_xlsx('data/MS_data/01_mouse_MCP_tableS2.xlsx', sheet = 1) 
+mouse_01 <- mouse_01_S2 |>
+  separate(Protein_ID, into = c('chrom', 'strand', 'position', 'orf_type', 'tx_name', 
+                                'length', 'discribe'), sep = ',', remove = F) |>
+  separate(position, into = c('gene_id', 'start', 'end', NA), sep = '_') |>
+  mutate(value = 0, 
+         start_new = ifelse(strand == '-', end, start),
+         end_new = ifelse(strand == '-', start, end), 
+         orf_id = sub(':', '_', Protein_ID)) |>
+  select(tx_name, start_new, end_new, orf_id, value, strand)
+write_tsv(mouse_01, 'data/mouse_01_position.txt', col_names = F)
+```
+
+```{bash}
+zcat gencode.vM25.annotation.gtf.gz | awk -v OFS="\t" '$3 == "exon"{ print $1, $4 - 1, $5, $12, $10, $7}' | sed 's/[";]//g' > gencode.vM25.annotation.exon.bed
+
+python src/GTFtools.py giv2tiv -g gencode.vM25.annotation.gtf.gz -i data/mouse_01_position.txt | awk -v OFS="\t" '{print $1, $7, $8, $4}'> data/mouse_01_tiv.txt
+
+python src/GTFtools.py tiv2giv -g gencode.vM25.annotation.gtf.gz -i data/mouse_01_tiv.txt -a | awk -v OFS="\t" '{$5 = $7; $4 = $16; for (i=1; i<=12; i++) printf("%s%s", $(i), i<12 ? OFS : "\n");}' > data/mouse_01.bed12
+```
+
+### CellMetab_F.Martinez_2023
+```{r}
+mouse_02_S4 <- read_xlsx('data/MS_data/02_mouse_tableS4andS8/tableS4.xlsx', sheet = 3) |>
+  filter(str_detect(protein, pattern = '>')) |>
+  separate(protein, into = c(NA, 'protein_id'), sep = 'smORF')
+mouse_02_S8 <- read_xlsx('data/MS_data/02_mouse_tableS4andS8/tableS8.xlsx', sheet = 3) |>
+  filter(str_detect(protein, pattern = '>')) |>
+  separate(protein, into = c(NA, 'protein_id'), sep = 'smORF')
+
+mouse_02_S1 <- read_xlsx('data/MS_data/02_mouse_tableS4andS8/tableS1.xlsx', sheet = 2) |>
+  mutate(protein_id = sub('[-+]', '', `smORF (mm10 coordinates and strand)`)) |>
+  select(Chr, protein_id, starts = `Exon Starts (0-based)`, ends = `Exon Stops (0-based)`, Strand)
+
+mouse_02_bed6 <- rbind(mouse_02_S4, mouse_02_S8) |>
+  left_join(mouse_02_S1, by = "protein_id") |> 
+  distinct() |>
+  #mutate(n = str_count(starts, pattern = ','))
+  separate(starts, into = letters[1:5], sep = ",") |>
+  pivot_longer(letters[1:5], names_to = 'n_start', values_to = 'start') |>
+  separate(ends, into = letters[1:5], sep = ",") |>
+  pivot_longer(letters[1:5], names_to = 'n_end', values_to = 'end') |>
+  filter(!start%in%c(NA, '') & !end%in%c(NA, '') & n_start == n_end) |>
+  mutate(value = 0) |> 
+  select(chrm = Chr, start, end, orf_id = protein_id, value, strand = Strand)
+
+mouse_02_bed12 <- mouse_02_bed6 |>
+  group_by(orf_id) |>
+  mutate(start = as.integer(start), end = as.integer(end)) |>
+  mutate(bed1 = chrm, 
+         bed2 = ifelse(strand == '+', min(start), min(start) - 3), 
+         bed3 = ifelse(strand == '+', max(end) + 3, max(end)), 
+         bed4 = orf_id, bed5 = value, bed6 = strand, 
+         bed7 = 0, bed8 = 0, bed9 = 0, bed10 = length(chrm), 
+         block_len = end - start, block_start = start - bed2) |>
+  select(-c(chrm, start, end, value, strand)) |>
+  mutate(bed11 = paste(block_len, collapse = ','), 
+         bed12 = paste(block_start, collapse = ','), 
+         bed4 = gsub(':|-', '_', bed4)) |>
+  slice_min(block_start, n = 1) |>
+  ungroup() |>
+  select(-c(block_len, block_start, orf_id)) 
+
+write_tsv(mouse_02_bed12, 'data/mouse_02.bed12', col_names = F)  
+```
+
+```{r}
+mart1 <- read_excel('data/MS_data/02_mouse_tableS4andS8/tableS4.xlsx', sheet = 2)
+mart2 <- read_excel('data/MS_data/02_mouse_tableS4andS8/tableS8.xlsx', sheet = 2)
+mart_msorfs <- bind_rows(mart1, mart2) |>
+    separate_longer_delim(protein, delim = ',') |> 
+    mutate(orf_id = str_remove(protein, 'smORF')) |>
+    distinct(protein, .keep_all = TRUE)
+
+# 1-based coordinates excluding stop codon
+mart_allorfs <- read_excel('data/MS_data/02_mouse_tableS4andS8/tableS1.xlsx', sheet = 2)
+mart_allorfs <- clean_names(mart_allorfs) |>
+    mutate(orf_id = str_sub(sm_orf_hg19_coordinates_and_strand, 2))
+
+mart_msorfs_bed6 <- mart_allorfs |>
+    filter(orf_id %in% mart_msorfs$orf_id) |>
+    mutate(across(c(start, end, microprotein_length), as.integer),
+           start = start - 1) |> 
+    select(chr, start, end, orf_id, microprotein_length, strand)
+write_tsv(mart_msorfs_bed6, file = 'data/ms_mouse/Martinez2023_genome_span_mm10.bed', col_names = FALSE)
+```
+
+```{bash}
+CrossMap.py bed --chromid s ../mm10ToMm39.over.chain Martinez2023_genome_span_mm10.bed Martinez2023_genome_span_GRCm39.bed
+
+python ../../src/gtf.py convert2bed -g ../Mus_musculus.GRCm39.107.gtf.gz >../Mus_musculus.GRCm39.107.gtf.exons.12cols.bed
+bedtools bed12tobed6 -i ../Mus_musculus.GRCm39.107.gtf.exons.12cols.bed > ../Mus_musculus.GRCm39.107.gtf.exons.bed
+
+bedtools intersect -s -wao -a Martinez2023_genome_span_GRCm39.bed -b ../Mus_musculus.GRCm39.107.gtf.exons.bed >Martinez2023_genome_span_GRCm39_exons_intersect.bed
+```
+
+```{r}
+mart_ei <- read_tsv('data/ms_mouse/Martinez2023_genome_span_GRCm39_exons_intersect.bed', col_names = FALSE)
+mart_ei <- mart_ei |>
+    filter(X10 != '.') |> 
+    mutate(across(c(X2, X3), as.integer), X2 = X2 + 1) |>
+    select(X10, X2, X3, X4, X5) |> 
+    distinct()
+write_tsv(mart_ei, file = 'data/ms_mouse/Martinez2023_msorfs_giv.tsv', col_names = FALSE)
+
+n_distinct(mart_ei$X4)
+```
+
+```{bash}
+python ../../src/gtf.py giv2tiv -g ../Mus_musculus.GRCm39.107.gtf.gz -i Martinez2023_msorfs_giv.tsv >Martinez2023_msorfs_tiv.tsv
+```
+
+```{r}
+mart_msorfs_tiv <- read_tsv('data/ms_mouse/Martinez2023_msorfs_tiv.tsv', col_names = FALSE)
+mart_msorfs_tiv <- mart_msorfs_tiv |> 
+    filter(X8 == 'exon', X9 == 'exon', X5 * 3 == (X7 - X6 + 1)) |> 
+    mutate(start = X6, end = X7 + 3) |> 
+    select(X1, start, end, X4)
+write_tsv(mart_msorfs_tiv, 'data/ms_mouse/Martinez2023_msorfs_tiv_updated.tsv', col_names = FALSE)
+n_distinct(mart_msorfs_tiv$X4)
+```
+
+```{bash}
+python ../../src/gtf.py tiv2giv -g ../Mus_musculus.GRCm39.107.gtf.gz -i Martinez2023_msorfs_tiv_updated.tsv -a | awk -v OFS="\t" '{$4 = $16; $5 = "0"; print $0}' | cut -f1-12 | sort | uniq >Martinez2023_msorfs_giv_updated.bed12
+python ../../src/ncorf_classifier3.py -k -m bed12 -p MS_ORFs_Martinez2023 Martinez2023_msorfs_giv_updated.bed12 ../Mus_musculus.GRCm39.107.gtf.gz ../Mus_musculus.GRCm39.107.gtf.txinfo
+```
+
+```{r}
+library(Biostrings)
+txseq <- c(readDNAStringSet('data/Mus_musculus.GRCm39.cdna.all.fa.gz'),
+           readDNAStringSet('data/Mus_musculus.GRCm39.ncrna.fa.gz'))
+names(txseq) <- str_remove(names(txseq), '\\..*')
+
+mart_msorfs_classified <- read_tsv('data/ms_mouse/MS_ORFs_Martinez2023_processed.tsv')
+mart_msorfs_seq <- subseq(txseq[mart_msorfs_classified$tx_name],
+                          start = mart_msorfs_classified$tstart,
+                          end = mart_msorfs_classified$tend)
+mart_msorfs_pep <- translate(mart_msorfs_seq)
+
+mart_msorfs_classified$pep <- str_remove(as.character(mart_msorfs_pep), '\\*$')
+mart_msorfs_classified$start_codon <- str_sub(as.character(mart_msorfs_seq), 1, 3)
+mart_msorfs_classified$stop_codon <- str_sub(as.character(mart_msorfs_seq), -3, -1)
+
+mart_msorfs_classified <- inner_join(
+    mart_msorfs_classified,
+    select(mart_allorfs, orf_id, oripep = microprotein_sequence))
+
+mart_msorfs_classified <- mart_msorfs_classified |> filter(pep == oripep)
+write_tsv(mart_msorfs_classified, file = 'data/ms_mouse/MS_ORFs_Martinez2023_processed_filtered.tsv')
+```
+
+### NAR_wang_2021
+```{r}
+mouse_04_S7_uorf <- read_xlsx('data/MS_data/04_mouse_NAR_tableS7.xlsx', sheet = 1) |>
+  select(orf_name, GenomePos, Blocks, MS_evidence)
+mouse_04_S7_dorf <- read_xlsx('data/MS_data/04_mouse_NAR_tableS7.xlsx', sheet = 2) |>
+  select(orf_name, GenomePos, Blocks, MS_evidence)
+mouse_04_S7_smorf <- read_xlsx('data/MS_data/04_mouse_NAR_tableS7.xlsx', sheet = 3, skip = 1)|>
+  select(orf_name, GenomePos, Blocks, MS_evidence)
+mouse_04 <- rbind(mouse_04_S7_uorf, mouse_04_S7_dorf, mouse_04_S7_smorf) |>
+  filter(MS_evidence == 'YES') |>
+  separate(GenomePos, into = c('chrom', NA, 'strand'), sep = ':') |>
+  separate(Blocks, into = as.character(1:42), sep = ",") |>
+  pivot_longer(as.character(1:42), names_to = 'n_Blocks', values_to = 'Blocks') |>
+  filter(!is.na(Blocks)) |>
+  separate(Blocks, into = c('start', 'end'), sep = "-") |>
+  mutate(value = 0) |> 
+  select(chrm = chrom, start, end, orf_id = orf_name, value, strand)
+
+mouse_04_bed12 <- mouse_04 |>
+  group_by(orf_id) |>
+  mutate(start = as.integer(start), end = as.integer(end)) |>
+  mutate(bed1 = chrm, bed2 = min(start), bed3 = max(end), bed4 = orf_id, bed5 = value, bed6 = strand, 
+         bed7 = 0, bed8 = 0, bed9 = 0, bed10 = length(chrm), 
+         block_len = end - start, block_start = start - bed2) |>
+  select(-c(chrm, start, end, value, strand)) |>
+  mutate(bed11 = paste(block_len, collapse = ','), 
+         bed12 = paste(block_start, collapse = ','), 
+         bed4 = gsub(':', '_', bed4)) |>
+  slice_min(block_start, n = 1) |>
+  ungroup() |>
+  select(-c(block_len, block_start, orf_id))
+
+write_tsv(mouse_04_bed12, 'data/mouse_04.bed12', col_names = F)  
+```
+
+### mouse_06 NAR_chen_2021
+```{r}
+mouse_06_S7 <- read_xlsx('data/MS_data/06_mouse_tableS7.xlsx') 
+mouse_06 <- mouse_06_S7 |>
+  filter(`MS data` != 0) |>
+  separate(GenomePos, into = c('chrom', 'position', 'strand'), sep = ':') |>
+  separate(position, into = c('start', 'end'), sep = '-') |>
+  mutate(value = 0) |>
+  select(chrom, start, end, orf_id =`uORF accession`, value, strand) 
+
+write_tsv(mouse_06, 'data/mouse_06_position.txt', col_names = F)
+```
+
+```{bash}
+zcat gencode.vM18.annotation.gtf.gz | awk -v OFS="\t" '$3 == "exon"{ print $1, $4 - 1, $5, $12, $10, $7}' | sed 's/[";]//g' > gencode.vM18.annotation.exon.bed
+
+bedtools intersect -a data/mouse_06_position.txt -b gencode.vM18.annotation.exon.bed -wao -s | awk -v OFS="\t" '{print $10, $2 + 1, $3, $4}' > data/mouse_06_giv.txt
+python src/GTFtools.py giv2tiv -g gencode.vM18.annotation.gtf.gz -i data/mouse_06_giv.txt > data/mouse_06_tiv.txt
+
+```
+
+```{r}
+orf <- read_tsv('data/mouse_06_tiv.txt', col_names = F) |>
+  rename(tx_name = X1, gstart = X2, gend = X3, orf_id = X4, tstart = X5, tend = X6,
+         tstart_loc = X7, tend_loc = X8) |>
+  filter(tstart_loc == 'exon', tend_loc == 'exon') |>
+  distinct() 
+
+orf_fine <- orf |>
+  group_by(orf_id, tx_name) |>
+  summarize(orf_len = sum(tend - tstart + 1),
+            orf_len2 = max(tend) - min(tstart) + 1) |>
+  filter(orf_len == orf_len2) |>
+  ungroup() |>
+  left_join(orf, by = c('orf_id', 'tx_name')) |>
+  select(tx_name, tstart, tend, orf_id) |>
+  mutate(orf_id = gsub(':|-', '_', orf_id))
+
+write_tsv(orf_fine, 'data/mouse_06_newtiv.txt', col_names = F)
+
+```
+
+```{bash}
+python src/GTFtools.py tiv2giv -g gencode.vM18.annotation.gtf.gz -i data/mouse_06_newtiv.txt -a | awk -v OFS="\t" '{$5 = $7; $4 = $16; for (i=1; i<=12; i++) printf("%s%s", $(i), i<12 ? OFS : "\n");}' > data/mouse_06.bed12
+```
+
+### GenomeBiol_D.Mackowiak_2015
+```{r}
+mouse_07_S11 <- read_xlsx('data/MS_data/07_mouse_tableS11.xlsx') 
+table(mouse_07_S11$type)
+mouse_07 <- mouse_07_S11 |>
+  filter(type != 'annotated' & !(`MS/MS: C2C12` == 'NA' & `MS/MS: Schwannhaeusser et al.` == 'NA' & 
+           `MS/MS: Azimifar et al.` == 'NA')) |>
+  select(orf_id = `#orfID`) |>
+  separate(orf_id, into = c('tx_name', 'position'), remove = F, sep = '_chr') |>
+  separate(position, c('chrom', 'start_end', 'strand'), sep = ':') |>
+  separate(start_end, c('start', 'end'), sep = '-') |>
+  mutate(chrom = paste0('chr', chrom), 
+         value = 0, 
+         orf_id = gsub(':', '_', orf_id)) |>
+  select(tx_name, start, end, orf_id, value, strand)
+
+write_tsv(mouse_07, 'data/mouse_07_position.txt', col_names = F)
+```
+
+```{bash}
+python src/GTFtools.py giv2tiv -g Mus_musculus.GRCm38.102.chr.gtf.gz -i data/mouse_07_position.txt | awk -v OFS="\t" '{print $1, $7, $8, $4}'> data/mouse_07_tiv.txt
+
+python src/GTFtools.py tiv2giv -g Mus_musculus.GRCm38.102.chr.gtf.gz -i data/mouse_07_tiv.txt -a | awk -v OFS="\t" '{$5 = $7; $4 = $16; for (i=1; i<=12; i++) printf("%s%s", $(i), i<12 ? OFS : "\n");}' > data/mouse_07.bed12
+
+sed 's/^/chr/' data/mouse_07.bed12 > data/mouse_07_chr.bed12
+
+```
+
+# Process MS-detected ORFs using the same pipeline for predicted translated ORFs 
+```{bash}
+python src/gtf.py txinfo -f -g Mus_musculus.GRCm39.107.gtf.gz > Mus_musculus.GRCm39.107.txinfo.tsv
+for i in data/human_*.bed12 ; do echo "sed 's/^chr//' $i | sort -u -k 4,4 > ${i%%.bed12}_nochr.bed12" ; done 
+for i in data/human*_nochr.bed12 ; do echo "python src/ncorf_classifier3.py -k -m bed12 $i Homo_sapiens.GRCh38.107.gtf.gz Homo_sapiens.GRCh38.107.gtf.txinfo -p ${i%%_nochr.bed12}" ; done 
+# src/ncorf_classifier3.py is renamed to src/orf_type.py
+
+## liftover
+for i in data/mouse_0*_GRCm39.bed12 ; do echo "sed 's/^chr//' $i | sort -u -k 4,4 > ${i%%GRCm39.bed12}nochr.bed12" ; done 
+for i in data/mouse_0*_nochr.bed12 ; do echo "python src/ncorf_classifier3.py -k -m bed12 $i Mus_musculus.GRCm39.107.gtf.gz Mus_musculus.GRCm39.107.gtf.txinfo -p ${i%%_nochr.bed12}" ; done 
+```
+
+## Filter ORFs supported by MS data using the same standards
+```{r}
+library(Biostrings)
+mouse <- c(readDNAStringSet('Mus_musculus.GRCm39.cdna.all.fa.gz'),
+           readDNAStringSet('Mus_musculus.GRCm39.ncrna.fa.gz'))
+names(mouse) <- str_remove(names(mouse), '\\..*')
+
+human <- c(readDNAStringSet('Homo_sapiens.GRCh38.cdna.all.fa.gz'), 
+           readDNAStringSet('Homo_sapiens.GRCh38.ncrna.fa.gz')) 
+names(human) <- str_remove(names(human), '\\..*')
+
+read_processed_tsv <- function(filepath, species){
+  mart_msorfs_classified <- read_tsv(filepath)
+  mart_msorfs_seq <- subseq(species[mart_msorfs_classified$tx_name],
+                          start = mart_msorfs_classified$tstart,
+                          end = mart_msorfs_classified$tend)
+  mart_msorfs_pep <- translate(mart_msorfs_seq)
+
+  mart_msorfs_classified$study <- as.character(gsub('^data/|_processed.tsv', '', filepath))
+  
+  mart_msorfs_classified$dna_seq <- as.character(mart_msorfs_seq)
+  mart_msorfs_classified$aa_seq <- str_remove(as.character(mart_msorfs_pep), '\\*$')
+  mart_msorfs_classified$start_codon <- str_sub(as.character(mart_msorfs_seq), 1, 3)
+  mart_msorfs_classified$stop_codon <- str_sub(as.character(mart_msorfs_seq), -3, -1)
+  mart_msorfs_classified$n_stop <- str_count(mart_msorfs_classified$aa_seq, '\\*')
+  
+  return(mart_msorfs_classified)
+}
+
+```
+
+### Mouse
+```{r}
+mouse_01_MCP_yang <- read_processed_tsv('data/mouse_01_processed.tsv', mouse)
+mouse_04_NAR_wang <- read_processed_tsv('data/mouse_04_processed.tsv', mouse)
+mouse_06_NAR_chen <- read_processed_tsv('data/mouse_06_processed.tsv', mouse)
+mouse_07_GenomeBiol_Mackowiak <- read_processed_tsv('data/mouse_07_processed.tsv', mouse)
+
+
+## mouse_01
+mouse_01_MCP_yang_filter <- mouse_01_MCP_yang |>
+  filter(start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG', 
+                            'AAG', 'ACG', 'AGG', 
+                            'ATA','ATC','ATT'), 
+         stop_codon %in% c('TAA', 'TAG', 'TGA'), 
+         n_stop == 0)
+
+## mouse_02
+mart_msorfs_seq <- subseq(mouse[mouse_02_tsv$tx_name],
+                          start = mouse_02_tsv$tstart,
+                          end = mouse_02_tsv$tend)
+mart_msorfs_pep <- translate(mart_msorfs_seq)
+
+mouse_02_tsv <- read_tsv('data/MS_ORFs_Martinez2023_processed_filtered.tsv') 
+mouse_02 <- mouse_02_tsv |>
+  mutate(study = 'mouse_02', 
+         dna_seq = as.character(mart_msorfs_seq), 
+         aa_seq = pep, n_stop = str_count(aa_seq, '\\*')) |>
+  filter(start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG', 
+                            'AAG', 'ACG', 'AGG', 
+                            'ATA','ATC','ATT'), 
+         stop_codon %in% c('TAA', 'TAG', 'TGA'), 
+         n_stop == 0) |>
+  select(names(human_CellRep_filter))
+
+## mouse_04
+mouse_04_NAR_wang_filter <- mouse_04_NAR_wang |>
+  filter(start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG', 
+                            'AAG', 'ACG', 'AGG', 
+                            'ATA','ATC','ATT'), 
+         stop_codon %in% c('TAA', 'TAG', 'TGA'), 
+         n_stop == 0)
+
+## mouse_06
+mouse_06_S7_protein_seq <- read_xlsx('data/MS_data/06_mouse_tableS7.xlsx') |>
+  mutate(orf_id = gsub('[:-]', '_', `uORF accession`), 
+         protein_seq = sub(';', '|', `Peptide hits`)) |>
+  select(orf_id, protein_seq)
+
+mouse_06_NAR_chen_filter <- mouse_06_NAR_chen |>
+  left_join(mouse_06_S7_protein_seq, by = 'orf_id') |>
+  filter(str_detect(aa_seq, protein_seq), 
+         start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG', 
+                            'AAG', 'ACG', 'AGG', 
+                            'ATA','ATC','ATT'), 
+         stop_codon %in% c('TAA', 'TAG', 'TGA'), 
+         n_stop == 0) |>
+  select(-protein_seq)
+
+## mouse_07
+mouse_07_S11_seq <- read_xlsx('data/MS_data/07_mouse_tableS11.xlsx') |>
+  rowwise() |>
+  mutate(orf_id = gsub(':', '_', `#orfID`), 
+         MS_1 = paste(c(str_match_all(`MS/MS: C2C12`, '(?<=sequence=)[A-Z]+(?=,score=)')[[1]]), collapse = '|'), 
+         MS_2 = paste(c(str_match_all(`MS/MS: Schwannhaeusser et al.`, '(?<=sequence=)[A-Z]+(?=,score=)')[[1]]), collapse = '|'), 
+         MS_3 = paste(c(str_match_all(`MS/MS: Azimifar et al.`, '(?<=sequence=)[A-Z]+(?=,score=)')[[1]]), collapse = '|'), 
+         protein_seq = paste(MS_1, MS_2, MS_3, sep = '|')) |>
+  select(orf_id, protein_seq) 
+  
+mouse_07_GenomeBiol_Mackowiak_filter <- mouse_07_GenomeBiol_Mackowiak |>
+  left_join(mouse_07_S11_seq, by = 'orf_id') |>
+  filter(str_detect(aa_seq, protein_seq), 
+         start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG', 
+                            'AAG', 'ACG', 'AGG', 
+                            'ATA','ATC','ATT'), 
+         stop_codon %in% c('TAA', 'TAG', 'TGA'), 
+         n_stop == 0) |>
+  select(-protein_seq)
+```
+
+### Human
+```{r}
+human_MolCell_tsv <- read_processed_tsv('data/human_MS_cell_processed.tsv', human)
+human_roadmap_tsv <- read_processed_tsv('data/human_MS_roadmap_processed.tsv', human)
+human_CellRep_tsv <- read_processed_tsv('data/human_MS_CellRep_processed.tsv', human)
+
+## human_MolCell
+human_MolCell_filter <- human_MolCell_tsv |>
+  filter(start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG', 
+                            'AAG', 'ACG', 'AGG', 
+                            'ATA','ATC','ATT'), 
+         stop_codon %in% c('TAA', 'TAG', 'TGA'), 
+         n_stop == 0)
+
+## human_roadmap
+human_roadmap_filter <- human_roadmap_tsv |>
+  filter(start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG', 
+                            'AAG', 'ACG', 'AGG', 
+                            'ATA','ATC','ATT'), 
+         stop_codon %in% c('TAA', 'TAG', 'TGA'), 
+         n_stop == 0)
+
+## human_MS_CellRep
+human_CellRep_seq <- read_csv('data/MS_data/Immunopeptidome/DoHH2/protein_origin_DOHH2_Non_Canonical.csv') |>
+  mutate(protein_seq = gsub(',', '|', Peptides)) |>
+  select(orf_id = Protein, protein_seq)
+
+human_CellRep_filter <- human_CellRep_tsv |>
+  left_join(human_CellRep_seq, by = 'orf_id') |>
+  filter(str_detect(aa_seq, protein_seq), 
+         start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG', 
+                            'AAG', 'ACG', 'AGG', 
+                            'ATA','ATC','ATT'), 
+         stop_codon %in% c('TAA', 'TAG', 'TGA'), 
+         n_stop == 0) |>
+  select(-protein_seq)
+
+```
+
+
+# Merge ORF data from different sources
+```{r}
+MS_orf_merge <- rbind(human_CellRep_filter, human_MolCell_filter, 
+                      human_roadmap_filter, 
+                      mouse_01_MCP_yang_filter, mouse_02, mouse_04_NAR_wang_filter, 
+                      mouse_06_NAR_chen_filter, mouse_07_GenomeBiol_Mackowiak_filter) |>
+  mutate(study = case_when(
+    study == 'human_MS_cell' ~ 'hsa_Chothani2022_MC', 
+    study == 'human_MS_CellRep' ~ 'hsa_Ruiz2021_CR', 
+    study == 'human_MS_roadmap' ~ 'hsa_Mudge2022_NB', 
+    study == 'mouse_01' ~ 'mmu_Yang2023_MCP', 
+    study == 'mouse_02' ~ 'mmu_Martinez2023_CM', 
+    study == 'mouse_04' ~ 'mmu_Wang2021_NAR', 
+    study == 'mouse_06' ~ 'mmu_Chen2021_NAR', 
+    study == 'mouse_07' ~ 'mmu_Mackowiak_GB'
+  ))
+write_tsv(MS_orf_merge, 'data/MS_orf_merge.tsv', col_names = T)
+```
+
+# More datasets of MS-detected ORFs in humans
+## hsa_Calviello2016_NM
+```{r}
+# Table S4
+hsa_Calviello2016_NM_data <- read_xlsx('data/MS_data/hsa_Calviello2016_NM.xlsx', sheet = 2)
+hsa_Calviello2016_NM_seq <- hsa_Calviello2016_NM_data |>
+  select(Sequence, Proteins) |>
+  distinct() |>
+  separate_longer_delim(cols = Proteins, delim = ';') |>
+  separate(Proteins, into = c('tx_position', NA), sep = ':(?=ENSG)', remove = F) |>
+  separate(tx_position, c('tx_name', 'tx_start', 'tx_end'), sep = '_', remove = F) |>
+  mutate(tx_end = as.integer(tx_end) + 2)
+
+write_tsv(hsa_Calviello2016_NM_seq[, c(4:6, 3)], 'data/hsa_Calviello2016_NM.tiv', col_names = F)
+
+```
+
+```{bash}
+python src/GTFtools.py tiv2giv -g gencode.v19.annotation.gtf.gz -i data/hsa_Calviello2016_NM.tiv -a | awk -v OFS="\t" '{$5 = $7; $4 = $16; for (i=1; i<=12; i++) printf("%s%s", $(i), i<12 ? OFS : "\n");}'  > data/hsa_Calviello2016_NM.bed12
+
+## liftover
+sed 's/chr//g' data/hsa_Calviello2016_NM_GRCh38.bed12 | sort -u -k 4,4 > data/hsa_Calviello2016_NM_nochr.bed12
+python src/ncorf_classifier3.py -k -m bed12 data/hsa_Calviello2016_NM_nochr.bed12 Homo_sapiens.GRCh38.107.gtf.gz Homo_sapiens.GRCh38.107.gtf.txinfo -p data/hsa_Calviello2016_NM 
+```
+
+## hsa_vanHeesch2019_Cell
+```{r}
+hsa_vanHeesch2019_Cell_S3 <- read_xlsx('data/MS_data/hsa_vanHeesch2019_Cell_S3.xlsx', skip = 1) |>
+  select(orf_id = `uORF ID (transcriptID_ORFstart_ORFstop)`, 
+         protein_seq = `Peptides detected by shotgun MS in the human heart  (Doll et al., Nat Comms 2017)`)
+hsa_vanHeesch2019_Cell_S5 <- read_xlsx('data/MS_data/hsa_vanHeesch2019_Cell_S5.xlsx', skip = 1) |>
+  select(orf_id = `ORF ID (transcriptID_ORFstart_ORFstop)`, 
+         protein_seq = `Peptides detected by shotgun MS in the human heart (Doll et al., Nat Comms 2017)`)
+hsa_vanHeesch2019_Cell_seq <- rbind(hsa_vanHeesch2019_Cell_S3, hsa_vanHeesch2019_Cell_S5)
+
+hsa_vanHeesch2019_Cell <- hsa_vanHeesch2019_Cell_seq |>
+  separate(orf_id, c('tx_name', 'tx_start', 'tx_end'), sep = '_', remove = F) |>
+  mutate(tx_end = as.integer(tx_end) + 2) |>
+  select(-protein_seq)
+
+write_tsv(hsa_vanHeesch2019_Cell[,c(2:4, 1)], 'data/hsa_vanHeesch2019_Cell.tiv')
+```
+
+```{bash}
+python src/GTFtools.py tiv2giv -g Homo_sapiens.GRCh38.87.gtf.gz -i data/hsa_vanHeesch2019_Cell.tiv -a | awk -v OFS="\t" '{$5 = $7; $4 = $16; for (i=1; i<=12; i++) printf("%s%s", $(i), i<12 ? OFS : "\n");}' | sort -u -k 4,4 > data/hsa_vanHeesch2019_Cell.bed12
+
+python src/ncorf_classifier3.py -k -m bed12 data/hsa_vanHeesch2019_Cell.bed12 Homo_sapiens.GRCh38.107.gtf.gz Homo_sapiens.GRCh38.107.gtf.txinfo -p data/hsa_vanHeesch2019_Cell 
+```
+
+## hsa_Cao2020_JPR
+```{r}
+hsa_Cao2020_JPR_data <- read_xlsx('data/MS_data/hsa_Cao2020_S3.xlsx', 
+                                  sheet = 2, skip = 6) |>
+  filter(str_detect(`Peptide ID`, '^[0-9]'))
+
+hsa_Cao2020_JPR <- hsa_Cao2020_JPR_data |>
+  select(protein_seq = `Peptide detected by shotgun proteomics`, 
+         iorf_id = `Genomic Coordinates`) |>
+  mutate(strand = ifelse(str_detect(iorf_id, 'forward'), '+', '-'), 
+         orf_position = gsub(',', '', iorf_id)) |>
+  separate(orf_position, c(NA, 'chrom', 'start', 'end'), 
+           sep = 'some |: *|-') |>
+  mutate(end = str_extract(end, '[0-9]+'), 
+         orf_id = paste(chrom, start, end, strand, sep = '_'), 
+         start = as.integer(start), 
+         start = ifelse(strand == '-', start - 1, start - 3))
+
+hsa_Cao2020_JPR_seq <- hsa_Cao2020_JPR |>
+  select(iorf_id, orf_id, protein_seq)
+
+hsa_Cao2020_JPR_position <- hsa_Cao2020_JPR |>
+  mutate(value = 0) |>
+  select(chrom, start, end, orf_id, value, strand)
+
+write_tsv(hsa_Cao2020_JPR_position, 'data/hsa_Cao2020_JPR_position.txt')
+```
+
+```{bash}
+gppy convert2bed -g Homo_sapiens.GRCh38.107.gtf.gz -t exon > Homo_sapiens.GRCh38.107.exon.bed12
+
+bedtools intersect -a data/hsa_Cao2020_JPR_position.txt -b Homo_sapiens.GRCh38.107.exon.bed12 -wao -s | awk -v OFS="\t" '{print $10, $2 + 1, $3, $4}' > data/hsa_Cao2020_JPR.giv
+
+gppy giv2tiv -g Homo_sapiens.GRCh38.107.gtf.gz -i data/hsa_Cao2020_JPR.giv > data/hsa_Cao2020_JPR.tiv
+```
+
+```{r}
+orf <- read_tsv('data/hsa_Cao2020_JPR.tiv', col_names = F) |>
+  dplyr::rename(tx_name = X1, gstart = X2, gend = X3, orf_id = X4, tstart = X5, 
+                tend = X6, tstart_loc = X7, tend_loc = X8) |>
+  filter(tstart_loc == 'exon', tend_loc == 'exon') |>
+  distinct() |>
+  select(tx_name, tstart, tend, orf_id)
+
+write_tsv(orf, 'data/hsa_Cao2020_JPR_newtiv.txt', col_names = F)
+```
+
+```{bash}
+gppy tiv2giv -g Homo_sapiens.GRCh38.107.gtf.gz -i data/hsa_Cao2020_JPR_newtiv.txt  -a | awk -v OFS="\t" '{$5 = $7; $4 = $16; for (i=1; i<=12; i++) printf("%s%s", $(i), i<12 ? OFS : "\n");}' | sort -u -k 4,4 > data/hsa_Cao2020_JPR.bed12
+
+python src/ncorf_classifier3.py -k -m bed12 data/hsa_Cao2020_JPR.bed12 Homo_sapiens.GRCh38.107.gtf.gz Homo_sapiens.GRCh38.107.gtf.txinfo -p data/hsa_Cao2020_JPR
+```
+
+## hsa_Martinez2020_NCB
+```{r}
+#Table S3
+hsa_Martinez2020_NCB_data <- read_xlsx('data/MS_data/hsa_Martinez2020_NCB.xlsx', 
+                                  sheet = 3)
+
+hsa_Martinez2020_NCB <- hsa_Martinez2020_NCB_data |>
+  select(iorf_id = `hg19 Coordinates (1-based)`, 
+         strand = `Strand Orientation`, 
+         protein_seq = `Microprotein Sequence`, 
+         starts = `Exon Starts (0-based)`, 
+         ends = `Exon Stops (0-based)`) |>
+  separate(iorf_id, c('chrom', NA), sep = ':', remove = F) |>
+  mutate(orf_id = sub(':|-', '_', iorf_id))
+  
+hsa_Martinez2020_NCB_seq <- hsa_Martinez2020_NCB |>
+  select(iorf_id, orf_id, protein_seq)
+
+hsa_Martinez2020_NCB_bed12 <- hsa_Martinez2020_NCB |>
+  select(chrom, starts, ends, orf_id, strand) |>
+  mutate(starts = sub(',$', '', starts), 
+         ends = sub(',$', '', ends)) |>
+  separate_longer_delim(c(starts, ends), delim = ',') |>
+  mutate(starts = as.integer(starts), ends = as.integer(ends)) |>
+  arrange(starts) |>
+  group_by(orf_id) %>%
+  summarize(chrom = chrom[1],
+            chromStart = min(starts),
+            chromEnd = max(ends),
+            name = orf_id[1],
+            score = 0,
+            strand = strand[1],
+            thickStart = chromStart,
+            thickEnd = chromEnd,
+            itemRgb = 0,
+            blockCount = n(),
+            blockSizes = str_c(ends - starts, collapse = ','),
+            bloockStarts = str_c(starts - starts[1], collapse = ','), .groups = 'drop') |>
+  select(-orf_id)
+
+write_tsv(hsa_Martinez2020_NCB_bed12, 'data/hsa_Martinez2020_NCB_hg19.bed12', col_names = F)
+```
+
+```{bash}
+## liftover
+sed 's/^chr//g' data/hsa_Martinez2020_NCB_GRCH38.bed12 | sort -u -k 4,4 > data/hsa_Martinez2020_NCB_nochr.bed12
+python src/ncorf_classifier3.py -k -m bed12 data/hsa_Martinez2020_NCB_nochr.bed12 Homo_sapiens.GRCh38.107.gtf.gz Homo_sapiens.GRCh38.107.gtf.txinfo -p data/hsa_Martinez2020_NCB
+```
+
+## hsa_Prensner2021_NB 
+```{r}
+hsa_Prensner2021_NB_S2 <- read_xlsx('data/MS_data/hsa_Prensner2021_NB.xlsx', 
+                                     sheet = 2, skip = 4) 
+hsa_Prensner2021_NB_S15 <- read_xlsx('data/MS_data/hsa_Prensner2021_NB.xlsx', 
+                                     sheet = 15, skip = 2) |>
+  separate_longer_delim(`ORF Name`, delim = ';')
+
+hsa_Prensner2021_NB_bed12 <- hsa_Prensner2021_NB_S2 |>
+  filter(Name %in% hsa_Prensner2021_NB_S15$`ORF Name`) |>
+  select(orf_id = Name, 
+         chrom = Chr, 
+         starts = `Exon Start (GCh38)`, 
+         ends = `Exon End (GCh38)`, 
+         strand = Strand) |>
+  separate_longer_delim(c(starts, ends), delim = ', ') |>
+  group_by(orf_id) |>
+  mutate(starts = as.integer(starts), ends = as.integer(ends), 
+         start_new = ifelse(strand == '+', starts - 1, ends - 1),
+         end_new = ifelse(strand == '+', ends , starts), 
+         orf_id = gsub(' ', '_', orf_id)) |>
+  arrange(start_new) |>
+  summarize(chrom = chrom[1],
+            chromStart = min(start_new),
+            chromEnd = max(end_new),
+            name = orf_id[1],
+            score = sum(end_new - start_new),
+            strand = strand[1],
+            thickStart = chromStart,
+            thickEnd = chromEnd,
+            itemRgb = 0,
+            blockCount = n(),
+            blockSizes = str_c(end_new - start_new, collapse = ','),
+            bloockStarts = str_c(start_new - start_new[1], collapse = ','), .groups = 'drop') |>
+  select(-orf_id) |>
+  filter((score %% 3) == 0)
+write_tsv(hsa_Prensner2021_NB_bed12, 'data/hsa_Prensner2021_NB.bed12', col_names = F)
+
+```
+
+```{bash}
+sed 's/chr//g' data/hsa_Prensner2021_NB.bed12 | sort -u -k 4,4 > data/hsa_Prensner2021_NB_nochr.bed12
+python src/ncorf_classifier3.py -k -m bed12 data/hsa_Prensner2021_NB_nochr.bed12 Homo_sapiens.GRCh38.107.gtf.gz Homo_sapiens.GRCh38.107.gtf.txinfo -p data/hsa_Prensner2021_NB
+```
+
+## hsa_Ouspenskaia2022_NB
+```{r}
+hsa_Ouspenskaia2022_NB_S4 <- read_xlsx('data/MS_data/hsa_Ouspenskaia2022_NB_S4.xlsx') |>
+  select(orf_id = ORF_ID) |>
+  distinct()
+tmp <- read_xlsx('data/MS_data/hsa_Ouspenskaia2022_NB_S4.xlsx') 
+
+hsa_Ouspenskaia2022_NB_S5 <- read_xlsx('data/MS_data/hsa_Ouspenskaia2022_NB_S5.xlsx') |>
+  select(orf_id = accession_numbers_nuORF) |>
+  separate_longer_delim(orf_id, delim = '|') |>
+  distinct()
+
+hsa_Ouspenskaia2022_NB_S6 <- read_xlsx('data/MS_data/hsa_Ouspenskaia2022_NB_S6.xlsx') |>
+  select(orf_id = `Alternative proteins`) |>
+  separate_longer_delim(orf_id, delim = ',')|>
+  distinct()
+
+sheet.index = 1:10
+data.list = list()
+for (i in sheet.index) {
+  data.list[[i]] = read_xlsx('data/MS_data/hsa_Ouspenskaia2022_NB_S8.xlsx', sheet = i) 
+}
+hsa_Ouspenskaia2022_NB_S8 <- bind_rows(data.list) |>
+  select(orf_id = `Alternative proteins`) |>
+  separate_longer_delim(orf_id, delim = ',')|>
+  distinct()
+
+hsa_Ouspenskaia2022_NB_S9 <- read_xlsx('data/MS_data/hsa_Ouspenskaia2022_NB_S9.xlsx') |>
+  select(orf_id = `Alternative proteins`) |>
+  separate_longer_delim(orf_id, delim = ',')|>
+  distinct()
+
+sheet.index = 1:16
+data.list = list()
+for (i in sheet.index) {
+  data.list[[i]] = read_xlsx('data/MS_data/hsa_Ouspenskaia2022_NB_S12.xlsx', sheet = i) 
+}
+hsa_Ouspenskaia2022_NB_S12 <- bind_rows(data.list) |>
+  select(orf_id = `Alternative proteins`, orf_type = condType) |>
+  separate_longer_delim(orf_id, delim = ',')|>
+  distinct() |>
+  filter(orf_type == 'nuORF') |>
+  select(orf_id)
+
+hsa_Ouspenskaia2022_NB_position <- rbind(hsa_Ouspenskaia2022_NB_S4, 
+                                    hsa_Ouspenskaia2022_NB_S5, 
+                                    hsa_Ouspenskaia2022_NB_S12)  |>
+  distinct() |>
+  separate(orf_id, c('tx_name', NA, 'position'), sep = '_', remove = F) |>
+  separate(position, c('chrom', 'start', 'end', 'strand'), sep = ':|(?<=[0-9])-') |>
+  mutate(value = 0, 
+         chrom = paste0('chr', chrom), 
+         orf_id = gsub(':', '_', orf_id)) |>
+  select(chrom, start, end, orf_id, value, strand) |>
+  filter(!is.na(start))
+
+write_tsv(hsa_Ouspenskaia2022_NB_position, 'data/hsa_Ouspenskaia2022_NB_position.txt', col_names = F)
+```
+
+```{bash}
+## liftover
+sed 's/chr//g' data/hsa_Ouspenskaia2022_NB_GRCh38.bed6 > data/hsa_Ouspenskaia2022_NB_nochr.bed6
+
+bedtools intersect -a data/hsa_Ouspenskaia2022_NB_nochr.bed6 -b Homo_sapiens.GRCh38.107.exon.bed12 -wao -s | awk -v OFS="\t" '{print $10, $2 + 1, $3, $4}' > data/hsa_Ouspenskaia2022_NB.giv
+
+gppy giv2tiv -g Homo_sapiens.GRCh38.107.gtf.gz -i data/hsa_Ouspenskaia2022_NB.giv > data/hsa_Ouspenskaia2022_NB.tiv
+
+```
+
+```{r}
+orf <- read_tsv('data/hsa_Ouspenskaia2022_NB.tiv', col_names = F) |>
+  rename(tx_name = X1, gstart = X2, gend = X3, orf_id = X4, tstart = X5, tend = X6,
+         tstart_loc = X7, tend_loc = X8) |>
+  filter(tstart_loc == 'exon', tend_loc == 'exon') |>
+  distinct() 
+
+orf_fine <- orf |>
+  group_by(orf_id, tx_name) |>
+  summarize(orf_len = sum(tend - tstart + 1),
+            orf_len2 = max(tend) - min(tstart) + 1) |>
+  filter(orf_len == orf_len2) |>
+  ungroup() |>
+  left_join(orf, by = c('orf_id', 'tx_name')) |>
+  select(tx_name, tstart, tend, orf_id)
+
+write_tsv(orf_fine, 'data/hsa_Ouspenskaia2022_NB_newtiv.txt', col_names = F)
+```
+
+```{bash}
+gppy tiv2giv -g Homo_sapiens.GRCh38.107.gtf.gz -i data/hsa_Ouspenskaia2022_NB_newtiv.txt  -a | awk -v OFS="\t" '{$5 = $7; $4 = $16; for (i=1; i<=12; i++) printf("%s%s", $(i), i<12 ? OFS : "\n");}'| sort -u -k 4,4 > data/hsa_Ouspenskaia2022_NB.bed12
+
+python src/ncorf_classifier3.py -k -m bed12 data/hsa_Ouspenskaia2022_NB.bed12 Homo_sapiens.GRCh38.107.gtf.gz Homo_sapiens.GRCh38.107.gtf.txinfo -p data/hsa_Ouspenskaia2022_NB
+```
+
+### Get the hsa_Ouspenskaia2022_NB_all.bed
+```{bash}
+## filter stop_codon is ture
+bedtools getfasta -fi Homo_sapiens.GRCh37.74.dna.primary_assembly.fa -fo data/Ouspenskaia2021_GRCh37.fa -bed ../done_ncorf/data/Ouspenskaia2021.bed -split -s -nameOnly
+```
+
+```{r}
+Ouspenskaia2021_fa <- readDNAStringSet('data/Ouspenskaia2021_GRCh37.fa')
+names(Ouspenskaia2021_fa) <- sub('\\(.*', '', names(Ouspenskaia2021_fa))
+
+Ouspenskaia2021_bed_F_name <- names(Ouspenskaia2021_fa[!(as.character(subseq(Ouspenskaia2021_fa, start = -3, end = -1)) %in% c('TAA', 'TAG', 'TGA'))])
+Ouspenskaia2021_bed_T_name <- names(Ouspenskaia2021_fa[as.character(subseq(Ouspenskaia2021_fa, start = -3, end = -1)) %in% c('TAA', 'TAG', 'TGA')])
+
+# read the GSE143263 bed 
+Ouspenskaia2021_bed <- read_tsv('../done_ncorf/data/Ouspenskaia2021.bed', col_names = F, col_types = 'ciicdciicicc') %>%
+  dplyr::rename(chrom = X1, chromStart = X2, chromEnd = X3, orf_id = X4, score = X5, strand = X6,
+                thickStart = X7, thickEnd = X8, itemRgb = X9, blockCount = X10, blockSizes = X11, blockStarts = X12)
+
+Ouspenskaia2021_bed_ture <- Ouspenskaia2021_bed |>
+  filter(orf_id %in% Ouspenskaia2021_bed_T_name)
+
+Ouspenskaia2021_bed_false <- Ouspenskaia2021_bed |>
+  filter(orf_id %in% Ouspenskaia2021_bed_F_name)
+  
+# chromStart & chromEnd + 3
+strand <- Ouspenskaia2021_bed_false$strand
+Ouspenskaia2021_bed_false$chromEnd[which(strand=="+")] <- Ouspenskaia2021_bed_false$chromEnd[which(strand=="+")] + 3
+Ouspenskaia2021_bed_false$chromStart[which(strand=="-")] <- Ouspenskaia2021_bed_false$chromStart[which(strand=="-")] - 3
+# blockSizes & blockStarts changes
+blockSizes <- lapply(strsplit(Ouspenskaia2021_bed_false$blockSizes, ','), as.integer)
+blockSizes_new <- mapply(function(x, y){
+  if(y == '+'){
+    x[length(x)] <- x[length(x)] + 3
+  }else{
+    x[1] <- x[1] + 3
+  }
+  paste0(x, collapse = ',')
+}, blockSizes, Ouspenskaia2021_bed_false$strand)
+
+blockStarts <- lapply(strsplit(Ouspenskaia2021_bed_false$blockStarts, ','), as.integer)
+blockStarts_new <- mapply(function(x, y){
+  if(y == '-' && length(x) > 1){
+    x[2:length(x)] <- x[2:length(x)] + 3
+  }
+  paste0(sprintf("%d", x), collapse = ',')
+}, blockStarts, Ouspenskaia2021_bed_false$strand)
+
+# add "chr" & change the orf_id "_"
+Ouspenskaia2021_bed_false <- Ouspenskaia2021_bed_false %>%
+  mutate(blockSizes = blockSizes_new, 
+         blockStarts = blockStarts_new)
+Ouspenskaia2021_bed_fine <- rbind(Ouspenskaia2021_bed_ture, Ouspenskaia2021_bed_false) |>
+  mutate(orf_id = gsub(':|-', '_', orf_id),
+         chrom = ifelse(grepl('^[0-9XY]', chrom), paste0('chr', chrom), chrom), 
+         chrom = ifelse(chrom == 'MT', 'chrM', chrom))
+write_tsv(Ouspenskaia2021_bed_fine, 'data/hsa_Ouspenskaia2022_NB_hg19_done.bed12', col_names = F)
+```
+
+```{bash}
+## liftover
+bedtools bed12tobed6 -i data/hsa_Ouspenskaia2022_NB_hg38_done.bed12 > data/hsa_Ouspenskaia2022_NB_hg38_done.bed6
+
+sed 's/^chr//' data/hsa_Ouspenskaia2022_NB_hg38_done.bed6 > data/hsa_Ouspenskaia2022_NB_hg38_nochr.bed6
+
+bedtools intersect -a data/hsa_Ouspenskaia2022_NB_hg38_nochr.bed6 -b Homo_sapiens.GRCh38.107.exon.bed12 -wao -s | awk -v OFS="\t" '{print $10, $2 + 1, $3, $4}' > data/hsa_Ouspenskaia2022_NB_done.giv
+
+gppy giv2tiv -g Homo_sapiens.GRCh38.107.gtf.gz -i data/hsa_Ouspenskaia2022_NB_done.giv > data/hsa_Ouspenskaia2022_NB_done.tiv
+```
+
+```{r}
+orf <- read_tsv('data/hsa_Ouspenskaia2022_NB_done.tiv', col_names = F) %>%
+  dplyr::rename(tx_name = X1, gstart = X2, gend = X3, orf_id = X4, tstart = X5, tend = X6,
+                tstart_loc = X7, tend_loc = X8) 
+
+orf2 <- inner_join(orf, Ouspenskaia2021_bed_fine, by = 'orf_id') %>%
+  select(tx_name, gstart, gend, orf_id, blockSizes, tstart, tend, tstart_loc, tend_loc) %>%
+  arrange(orf_id, tx_name) 
+
+blockSizes <- lapply(strsplit(orf2$blockSizes, ','), as.integer)
+
+blockSizes_sum <- sapply(1:length(blockSizes), function(i){
+    paste0(sum(blockSizes[[i]]), collapse = ',') 
+  })
+
+orf_fine <- orf2 %>%
+  mutate(ori_len = blockSizes_sum) %>%
+  filter(tstart_loc == 'exon', tend_loc == 'exon') %>%
+  group_by(orf_id, tx_name) %>%
+  summarize(ori_len,
+            orf_len = sum(tend - tstart + 1),
+            orf_len2 = max(tend) - min(tstart) + 1,
+            orf_len3 = sum(gend - gstart + 1)) %>% 
+  ungroup() %>%
+  filter(
+    orf_len  == ori_len, 
+    orf_len2 == ori_len, 
+    orf_len3 == orf_len) 
+
+orf_tiv <- orf %>% inner_join(orf_fine[, 1:2], by = c('tx_name', 'orf_id')) %>%
+  group_by(orf_id, tx_name) %>%
+  summarize(tstart = min(tstart), tend = max(tend), .groups = 'drop') %>%
+  relocate(orf_id, .after = tend)
+
+write_tsv(orf_tiv, col_names = FALSE, file = 'data/hsa_Ouspenskaia2022_NB_done_new.tiv')
+```
+
+
+```{bash}
+gppy tiv2giv -g Homo_sapiens.GRCh38.107.gtf.gz -i data/hsa_Ouspenskaia2022_NB_done_new.tiv -a | awk -v OFS="\t" '{$5 = $4; $4 = $16; for (i=1; i<=12; i++) printf("%s%s", $(i), i<12 ? OFS : "\n");}' > data/hsa_Ouspenskaia2022_NB_all.bed
+```
+
+
+```{r}
+hsa_Ouspenskaia2022_NB <- rbind(hsa_Ouspenskaia2022_NB_S4, 
+                                hsa_Ouspenskaia2022_NB_S12) |>
+  distinct() |>
+  mutate(orf_id = gsub(':|-', '_', orf_id))
+
+hsa_Ouspenskaia2022_NB_bed <- read_tsv('data/hsa_Ouspenskaia2022_NB_all.bed', 
+                                       col_names = F, col_types = 'ciiccciicicc') |>
+  filter(X4 %in% hsa_Ouspenskaia2022_NB$orf_id) |>
+  mutate(X5 = 0) |>
+  distinct()
+
+write_tsv(hsa_Ouspenskaia2022_NB_bed, col_names = FALSE, 'data/hsa_Ouspenskaia2022_NB.bed')
+```
+
+```{bash}
+python src/ncorf_classifier3.py -k -m bed12 data/hsa_Ouspenskaia2022_NB.bed Homo_sapiens.GRCh38.107.gtf.gz Homo_sapiens.GRCh38.107.gtf.txinfo -p data/hsa_Ouspenskaia2022_NB
+```
+
+## Filter ORFs supported by MS data using the same standards
+```{r}
+hsa_Calviello2016_NM_tsv <- read_processed_tsv('data/hsa_Calviello2016_NM_processed.tsv', human)
+hsa_vanHeesch2019_Cell_tsv <- read_processed_tsv('data/hsa_vanHeesch2019_Cell_processed.tsv', human)
+hsa_Martinez2020_NCB_tsv <- read_processed_tsv('data/hsa_Martinez2020_NCB_processed.tsv', human)
+hsa_Prensner2021_NB_tsv <- read_processed_tsv('data/hsa_Prensner2021_NB_processed.tsv', human)
+hsa_Ouspenskaia2022_NB_tsv <- read_processed_tsv('data/hsa_Ouspenskaia2022_NB_processed.tsv', human)
+
+## hsa_Calviello2016_NM
+hsa_Calviello2016_NM_filter <- hsa_Calviello2016_NM_tsv |>
+  left_join(hsa_Calviello2016_NM_seq[,c(1, 3)], by = c('orf_id' = 'tx_position')) |>
+  filter(str_detect(aa_seq, Sequence), 
+         start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG', 
+                            'AAG', 'ACG', 'AGG', 
+                            'ATA','ATC','ATT'), 
+         stop_codon %in% c('TAA', 'TAG', 'TGA'), 
+         n_stop == 0) |>
+  select(-Sequence)
+
+## hsa_vanHeesch2019_Cell
+hsa_vanHeesch2019_Cell_filter <- hsa_vanHeesch2019_Cell_tsv |>
+  left_join(hsa_vanHeesch2019_Cell_seq, by = 'orf_id') |>
+  filter(str_detect(aa_seq, protein_seq), 
+         start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG', 
+                            'AAG', 'ACG', 'AGG', 
+                            'ATA','ATC','ATT'), 
+         stop_codon %in% c('TAA', 'TAG', 'TGA'), 
+         n_stop == 0) |>
+  select(-protein_seq)
+
+## hsa_Martinez2020_NCB
+hsa_Martinez2020_NCB_filter <- hsa_Martinez2020_NCB_tsv |>
+  left_join(hsa_Martinez2020_NCB_seq[, c(2,3)], by = 'orf_id') |>
+  filter(str_detect(aa_seq, protein_seq), 
+         start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG', 
+                            'AAG', 'ACG', 'AGG', 
+                            'ATA','ATC','ATT'), 
+         stop_codon %in% c('TAA', 'TAG', 'TGA'), 
+         n_stop == 0) |>
+  select(-protein_seq)
+
+
+## hsa_Prensner2021_NB
+hsa_Prensner2021_NB_filter <- hsa_Prensner2021_NB_tsv |>
+  filter(start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG', 
+                            'AAG', 'ACG', 'AGG', 
+                            'ATA','ATC','ATT'), 
+         stop_codon %in% c('TAA', 'TAG', 'TGA'), 
+         n_stop == 0) 
+
+## hsa_Ouspenskaia2022_NB
+hsa_Ouspenskaia2022_NB_filter <- hsa_Ouspenskaia2022_NB_tsv |>
+  filter(start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG', 
+                            'AAG', 'ACG', 'AGG', 
+                            'ATA','ATC','ATT'), 
+         stop_codon %in% c('TAA', 'TAG', 'TGA'), 
+         n_stop == 0) 
+```
+
+# Merge MS-detected ORFs into a single table
+```{r}
+MS_orf_merge <- read_tsv('data/MS_orf_merge.tsv')
+MS_merge <- rbind(MS_orf_merge, hsa_Calviello2016_NM_filter, hsa_vanHeesch2019_Cell_filter, hsa_Martinez2020_NCB_filter, hsa_Prensner2021_NB_filter, hsa_Ouspenskaia2022_NB_filter)
+
+write_tsv(MS_merge, 'data/all_MS_merge.txt')
+```
