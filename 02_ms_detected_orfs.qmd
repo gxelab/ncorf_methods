@@ -9,6 +9,7 @@ library(Biostrings)
 ## Human
 ### hsa_Chothani2022_MC
 ```{r}
+# GRCh38
 sonia_gtf <- read_tsv('data/Sonia_2022_MolCell_smORF_7767.gtf', col_names = FALSE)
 
 sonia_bed12 <- sonia_gtf |>
@@ -41,6 +42,7 @@ write_tsv(human_MS_cell_bed12, file = 'data/human_MS_cell.bed12', col_names = F)
 
 ### hsa_Mudge2022_NB
 ```{r}
+# GRCh38
 human_MS_roadmap_1 <- read_xlsx('data/MS_data/human_roadmap_MS.xlsx', sheet = 3) |>
   filter(number_studies_MS > 0) |>
   select(chrm, starts, ends, strand, transcript, gene_id, gene_name, orf_biotype)
@@ -77,9 +79,13 @@ human_MS_roadmap_bed12 <- human_MS_roadmap_bed6 |>
 write_tsv(human_MS_roadmap_bed12, 'data/human_MS_roadmap.bed12', col_names = F)  
 ```
 
-### hsa_Ruiz2021_CR
+### hsa_RuizCuevas2021_CR
 ```{r}
-human_CellRep <- read_csv('data/MS_data/Immunopeptidome/DoHH2/protein_origin_DOHH2_Non_Canonical.csv')
+# GRCh38.p10 (GENCODE version 26)
+human_CellRep1 <- read_csv('data/MS_data/Immunopeptidome/DoHH2/protein_origin_DOHH2_Non_Canonical.csv')
+human_CellRep2 <- read_csv('data/MS_data/Immunopeptidome/HBL-1/protein_origin_HBL1_Non_Canonical.csv')
+human_CellRep3 <- read_csv('data/MS_data/Immunopeptidome/SuDHL4/protein_origin_SUDHL4_Non_Canonical.csv')
+human_CellRep <- rbind(human_CellRep1, human_CellRep2, human_CellRep3)
 
 human_CellRep_bed12 <- human_CellRep |>
   separate(Protein, into = c(NA, 'start_position'), sep = '-(?=chr)', remove = F) |>
@@ -115,6 +121,7 @@ write_tsv(human_CellRep_bed12, file = 'data/human_MS_CellRep.bed12', col_names =
 ## Mouse
 ### MCP_yang_2023
 ```{r}
+# GENCODE vM25
 mouse_01_S2 <- read_xlsx('data/MS_data/01_mouse_MCP_tableS2.xlsx', sheet = 1) 
 mouse_01 <- mouse_01_S2 |>
   separate(Protein_ID, into = c('chrom', 'strand', 'position', 'orf_type', 'tx_name', 
@@ -138,6 +145,7 @@ python src/GTFtools.py tiv2giv -g gencode.vM25.annotation.gtf.gz -i data/mouse_0
 
 ### CellMetab_F.Martinez_2023
 ```{r}
+# mm10
 mouse_02_S4 <- read_xlsx('data/MS_data/02_mouse_tableS4andS8/tableS4.xlsx', sheet = 3) |>
   filter(str_detect(protein, pattern = '>')) |>
   separate(protein, into = c(NA, 'protein_id'), sep = 'smORF')
@@ -268,6 +276,7 @@ write_tsv(mart_msorfs_classified, file = 'data/ms_mouse/MS_ORFs_Martinez2023_pro
 
 ### NAR_wang_2021
 ```{r}
+# mm10
 mouse_04_S7_uorf <- read_xlsx('data/MS_data/04_mouse_NAR_tableS7.xlsx', sheet = 1) |>
   select(orf_name, GenomePos, Blocks, MS_evidence)
 mouse_04_S7_dorf <- read_xlsx('data/MS_data/04_mouse_NAR_tableS7.xlsx', sheet = 2) |>
@@ -303,6 +312,7 @@ write_tsv(mouse_04_bed12, 'data/mouse_04.bed12', col_names = F)
 
 ### mouse_06 NAR_chen_2021
 ```{r}
+# GRCh38.p6 (GENCODE vM18)
 mouse_06_S7 <- read_xlsx('data/MS_data/06_mouse_tableS7.xlsx') 
 mouse_06 <- mouse_06_S7 |>
   filter(`MS data` != 0) |>
@@ -349,6 +359,7 @@ python src/GTFtools.py tiv2giv -g gencode.vM18.annotation.gtf.gz -i data/mouse_0
 
 ### GenomeBiol_D.Mackowiak_2015
 ```{r}
+# mm10
 mouse_07_S11 <- read_xlsx('data/MS_data/07_mouse_tableS11.xlsx') 
 table(mouse_07_S11$type)
 mouse_07 <- mouse_07_S11 |>
@@ -367,9 +378,9 @@ write_tsv(mouse_07, 'data/mouse_07_position.txt', col_names = F)
 ```
 
 ```{bash}
-python src/GTFtools.py giv2tiv -g Mus_musculus.GRCm38.102.chr.gtf.gz -i data/mouse_07_position.txt | awk -v OFS="\t" '{print $1, $7, $8, $4}'> data/mouse_07_tiv.txt
+python src/GTFtools.py giv2tiv -g Mus_musculus.GRCm38.76.gtf.gz -i data/mouse_07_position.txt | awk -v OFS="\t" '{print $1, $7, $8, $4}'> data/mouse_07_tiv.txt
 
-python src/GTFtools.py tiv2giv -g Mus_musculus.GRCm38.102.chr.gtf.gz -i data/mouse_07_tiv.txt -a | awk -v OFS="\t" '{$5 = $7; $4 = $16; for (i=1; i<=12; i++) printf("%s%s", $(i), i<12 ? OFS : "\n");}' > data/mouse_07.bed12
+python src/GTFtools.py tiv2giv -g Mus_musculus.GRCm38.76.gtf.gz -i data/mouse_07_tiv.txt -a | awk -v OFS="\t" '{$5 = $7; $4 = $16; for (i=1; i<=12; i++) printf("%s%s", $(i), i<12 ? OFS : "\n");}' > data/mouse_07.bed12
 
 sed 's/^/chr/' data/mouse_07.bed12 > data/mouse_07_chr.bed12
 
@@ -520,7 +531,12 @@ human_roadmap_filter <- human_roadmap_tsv |>
          n_stop == 0)
 
 ## human_MS_CellRep
-human_CellRep_seq <- read_csv('data/MS_data/Immunopeptidome/DoHH2/protein_origin_DOHH2_Non_Canonical.csv') |>
+human_CellRep1 <- read_csv('data/MS_data/Immunopeptidome/DoHH2/protein_origin_DOHH2_Non_Canonical.csv')
+human_CellRep2 <- read_csv('data/MS_data/Immunopeptidome/HBL-1/protein_origin_HBL1_Non_Canonical.csv')
+human_CellRep3 <- read_csv('data/MS_data/Immunopeptidome/SuDHL4/protein_origin_SUDHL4_Non_Canonical.csv')
+human_CellRep <- rbind(human_CellRep1, human_CellRep2, human_CellRep3)
+
+human_CellRep_seq <- human_CellRep |>
   mutate(protein_seq = gsub(',', '|', Peptides)) |>
   select(orf_id = Protein, protein_seq)
 
@@ -545,7 +561,7 @@ MS_orf_merge <- rbind(human_CellRep_filter, human_MolCell_filter,
                       mouse_06_NAR_chen_filter, mouse_07_GenomeBiol_Mackowiak_filter) |>
   mutate(study = case_when(
     study == 'human_MS_cell' ~ 'hsa_Chothani2022_MC', 
-    study == 'human_MS_CellRep' ~ 'hsa_Ruiz2021_CR', 
+    study == 'human_MS_CellRep' ~ 'hsa_RuizCuevas2021_CR', 
     study == 'human_MS_roadmap' ~ 'hsa_Mudge2022_NB', 
     study == 'mouse_01' ~ 'mmu_Yang2023_MCP', 
     study == 'mouse_02' ~ 'mmu_Martinez2023_CM', 
@@ -559,6 +575,7 @@ write_tsv(MS_orf_merge, 'data/MS_orf_merge.tsv', col_names = T)
 # More datasets of MS-detected ORFs in humans
 ## hsa_Calviello2016_NM
 ```{r}
+# hg19 (GENCODE version 19)
 # Table S4
 hsa_Calviello2016_NM_data <- read_xlsx('data/MS_data/hsa_Calviello2016_NM.xlsx', sheet = 2)
 hsa_Calviello2016_NM_seq <- hsa_Calviello2016_NM_data |>
@@ -583,6 +600,7 @@ python src/ncorf_classifier3.py -k -m bed12 data/hsa_Calviello2016_NM_nochr.bed1
 
 ## hsa_vanHeesch2019_Cell
 ```{r}
+# hg38 (Ensembl release 87)
 hsa_vanHeesch2019_Cell_S3 <- read_xlsx('data/MS_data/hsa_vanHeesch2019_Cell_S3.xlsx', skip = 1) |>
   select(orf_id = `uORF ID (transcriptID_ORFstart_ORFstop)`, 
          protein_seq = `Peptides detected by shotgun MS in the human heart  (Doll et al., Nat Comms 2017)`)
@@ -607,6 +625,7 @@ python src/ncorf_classifier3.py -k -m bed12 data/hsa_vanHeesch2019_Cell.bed12 Ho
 
 ## hsa_Cao2020_JPR
 ```{r}
+# hg38
 hsa_Cao2020_JPR_data <- read_xlsx('data/MS_data/hsa_Cao2020_S3.xlsx', 
                                   sheet = 2, skip = 6) |>
   filter(str_detect(`Peptide ID`, '^[0-9]'))
@@ -660,7 +679,8 @@ python src/ncorf_classifier3.py -k -m bed12 data/hsa_Cao2020_JPR.bed12 Homo_sapi
 
 ## hsa_Martinez2020_NCB
 ```{r}
-#Table S3
+# hg19
+# Table S3
 hsa_Martinez2020_NCB_data <- read_xlsx('data/MS_data/hsa_Martinez2020_NCB.xlsx', 
                                   sheet = 3)
 
@@ -709,6 +729,7 @@ python src/ncorf_classifier3.py -k -m bed12 data/hsa_Martinez2020_NCB_nochr.bed1
 
 ## hsa_Prensner2021_NB 
 ```{r}
+# hg38
 hsa_Prensner2021_NB_S2 <- read_xlsx('data/MS_data/hsa_Prensner2021_NB.xlsx', 
                                      sheet = 2, skip = 4) 
 hsa_Prensner2021_NB_S15 <- read_xlsx('data/MS_data/hsa_Prensner2021_NB.xlsx', 
@@ -754,6 +775,7 @@ python src/ncorf_classifier3.py -k -m bed12 data/hsa_Prensner2021_NB_nochr.bed12
 
 ## hsa_Ouspenskaia2022_NB
 ```{r}
+# hg19 (GENCODE v26lift37)
 hsa_Ouspenskaia2022_NB_S4 <- read_xlsx('data/MS_data/hsa_Ouspenskaia2022_NB_S4.xlsx') |>
   select(orf_id = ORF_ID) |>
   distinct()
@@ -952,11 +974,9 @@ orf_tiv <- orf %>% inner_join(orf_fine[, 1:2], by = c('tx_name', 'orf_id')) %>%
 write_tsv(orf_tiv, col_names = FALSE, file = 'data/hsa_Ouspenskaia2022_NB_done_new.tiv')
 ```
 
-
 ```{bash}
 gppy tiv2giv -g Homo_sapiens.GRCh38.107.gtf.gz -i data/hsa_Ouspenskaia2022_NB_done_new.tiv -a | awk -v OFS="\t" '{$5 = $4; $4 = $16; for (i=1; i<=12; i++) printf("%s%s", $(i), i<12 ? OFS : "\n");}' > data/hsa_Ouspenskaia2022_NB_all.bed
 ```
-
 
 ```{r}
 hsa_Ouspenskaia2022_NB <- rbind(hsa_Ouspenskaia2022_NB_S4, 
