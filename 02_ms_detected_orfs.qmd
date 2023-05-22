@@ -623,60 +623,6 @@ python src/GTFtools.py tiv2giv -g Homo_sapiens.GRCh38.87.gtf.gz -i data/hsa_vanH
 python src/ncorf_classifier3.py -k -m bed12 data/hsa_vanHeesch2019_Cell.bed12 Homo_sapiens.GRCh38.107.gtf.gz Homo_sapiens.GRCh38.107.gtf.txinfo -p data/hsa_vanHeesch2019_Cell 
 ```
 
-## hsa_Cao2020_JPR
-```{r}
-# hg38
-hsa_Cao2020_JPR_data <- read_xlsx('data/MS_data/hsa_Cao2020_S3.xlsx', 
-                                  sheet = 2, skip = 6) |>
-  filter(str_detect(`Peptide ID`, '^[0-9]'))
-
-hsa_Cao2020_JPR <- hsa_Cao2020_JPR_data |>
-  select(protein_seq = `Peptide detected by shotgun proteomics`, 
-         iorf_id = `Genomic Coordinates`) |>
-  mutate(strand = ifelse(str_detect(iorf_id, 'forward'), '+', '-'), 
-         orf_position = gsub(',', '', iorf_id)) |>
-  separate(orf_position, c(NA, 'chrom', 'start', 'end'), 
-           sep = 'some |: *|-') |>
-  mutate(end = str_extract(end, '[0-9]+'), 
-         orf_id = paste(chrom, start, end, strand, sep = '_'), 
-         start = as.integer(start), 
-         start = ifelse(strand == '-', start - 1, start - 3))
-
-hsa_Cao2020_JPR_seq <- hsa_Cao2020_JPR |>
-  select(iorf_id, orf_id, protein_seq)
-
-hsa_Cao2020_JPR_position <- hsa_Cao2020_JPR |>
-  mutate(value = 0) |>
-  select(chrom, start, end, orf_id, value, strand)
-
-write_tsv(hsa_Cao2020_JPR_position, 'data/hsa_Cao2020_JPR_position.txt')
-```
-
-```{bash}
-gppy convert2bed -g Homo_sapiens.GRCh38.107.gtf.gz -t exon > Homo_sapiens.GRCh38.107.exon.bed12
-
-bedtools intersect -a data/hsa_Cao2020_JPR_position.txt -b Homo_sapiens.GRCh38.107.exon.bed12 -wao -s | awk -v OFS="\t" '{print $10, $2 + 1, $3, $4}' > data/hsa_Cao2020_JPR.giv
-
-gppy giv2tiv -g Homo_sapiens.GRCh38.107.gtf.gz -i data/hsa_Cao2020_JPR.giv > data/hsa_Cao2020_JPR.tiv
-```
-
-```{r}
-orf <- read_tsv('data/hsa_Cao2020_JPR.tiv', col_names = F) |>
-  dplyr::rename(tx_name = X1, gstart = X2, gend = X3, orf_id = X4, tstart = X5, 
-                tend = X6, tstart_loc = X7, tend_loc = X8) |>
-  filter(tstart_loc == 'exon', tend_loc == 'exon') |>
-  distinct() |>
-  select(tx_name, tstart, tend, orf_id)
-
-write_tsv(orf, 'data/hsa_Cao2020_JPR_newtiv.txt', col_names = F)
-```
-
-```{bash}
-gppy tiv2giv -g Homo_sapiens.GRCh38.107.gtf.gz -i data/hsa_Cao2020_JPR_newtiv.txt  -a | awk -v OFS="\t" '{$5 = $7; $4 = $16; for (i=1; i<=12; i++) printf("%s%s", $(i), i<12 ? OFS : "\n");}' | sort -u -k 4,4 > data/hsa_Cao2020_JPR.bed12
-
-python src/ncorf_classifier3.py -k -m bed12 data/hsa_Cao2020_JPR.bed12 Homo_sapiens.GRCh38.107.gtf.gz Homo_sapiens.GRCh38.107.gtf.txinfo -p data/hsa_Cao2020_JPR
-```
-
 ## hsa_Martinez2020_NCB
 ```{r}
 # hg19
