@@ -1,0 +1,1292 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# merge data
+
+```{r}
+## gxelab
+library(data.table)
+library(tidyverse)
+library(patchwork)
+library(forcats)
+library(glue)
+library(stringi)
+library(stringr)
+library(readxl)
+
+## Read transcript annotations
+appris_tsl_human <- fread('data/human_mart_export.txt')
+setnames(appris_tsl_human, c('gene_id', 'tx_name', 'appris', 'tsl'))
+
+appris_tsl_human[, tsl := sub(' .*', '', tsl)]
+appris_tsl_human[, tsl := factor(ifelse(tsl == '', 'tslNA', tsl))]
+appris_tsl_human[, appris := factor(appris, levels = c(
+  c("principal1", "principal2", "principal3", "principal4", "principal5",
+    "alternative1", "alternative2", "")))]
+
+appris_tsl_mouse <- fread('data/mouse_mart_export.txt')
+setnames(appris_tsl_mouse, c('gene_id', 'tx_name', 'appris', 'tsl'))
+appris_tsl_mouse[, tsl := sub(' .*', '', tsl)]
+appris_tsl_mouse[, tsl := factor(ifelse(tsl == '', 'tslNA', tsl))]
+appris_tsl_mouse[, appris := factor(appris, levels = c(
+  c("principal1", "principal2", "principal3", "principal4", "principal5",
+    "alternative1", "alternative2", "")))]
+
+get_ncorfs <- function(xpath){
+    # exclude annotated CDSs or truncation/extension variants
+    type_cds <- c(
+        'CDS', 'C_extension', 'C_truncation', 'N_extension',
+        'N_truncation', 'sCDS', 'iCDS', 'wCDS')
+    type_ncorf <- c('uORF', 'uoORF', 'iORF', 'doORF', 'dORF', 'lncRNA-ORF')
+    dtt <- fread(xpath)
+    dtt[, uuid := glue_data(.SD, '{chrom}_{gstart}_{gend}_{orf_len}{strand}')]
+    cds_variants <- dtt[orf_type %in% type_cds]
+    orfs <- dtt[!uuid %in% cds_variants$uuid]
+    orfs <- orfs[orf_type %in% type_ncorf]
+    orfs <- orfs[psite_total >= 10 & psite_total / n_codon >= 0.5 & orf_len >= 18]
+    
+    # exclude non-NTG start codons (mainly from PRICE,
+    # which doesn't allow setting candidate start codons)
+    orfs <- orfs[start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG')]
+    
+    # assign ORFs to a single transcript based on appris/tsl score
+    if(grepl('human', xpath)){
+        orfs <- merge(orfs, appris_tsl_human, by = c('gene_id', 'tx_name'))
+    }else{
+        orfs <- merge(orfs, appris_tsl_mouse, by = c('gene_id', 'tx_name'))
+    }
+    orfs <- orfs[order(gene_id, appris, tsl, tx_name)]
+    orfs <- orfs[!duplicated(uuid)]
+    
+    # merge ORFs that are in the same transcripts and have the same stop codon
+    # keep the most upstream best-tier start codons
+    orfs[, start_tier := fct_collapse(
+        start_codon, AUG = 'ATG', SUG = c('CTG', 'GTG'),
+        UUG = 'TTG', other_level = 'other')]
+    orfs <- orfs[order(tx_name, tend, start_tier, tstart)]
+    orfs <- unique(orfs, by = c('tx_name', 'tend'))
+    
+    return(orfs)
+}
+
+## Batch effect data 14
+processed_files <- list.files('results', pattern = 'human_SRR[0-9]*_[a-z]*_merge.tsv', full.names = TRUE)
+names(processed_files) <- sub(r'(_merge.tsv)', '', basename(processed_files))
+
+batch_effect_dtts <- lapply(processed_files, get_ncorfs)
+
+for (i in names(batch_effect_dtts)) {
+  batch_effect_dtts[i][[1]]$chrom <- as.character(batch_effect_dtts[i][[1]]$chrom)
+}
+
+batch_effect_dtt <- bind_rows(batch_effect_dtts, .id = 'file_info') |>
+  separate(file_info, c('species', 'library', 'method'), sep = '_') 
+write_tsv(batch_effect_dtt, 'results/merge_batch_effect_14.tsv')
+
+## Different quality of data 7
+processed_files <- list.files('results', pattern = '_dif_quality_.*_merge.tsv', full.names = TRUE)
+names(processed_files) <- sub(r'(_merge.tsv)', '', basename(processed_files))
+
+dif_quality_dtts <- lapply(processed_files, get_ncorfs)
+
+for (i in names(dif_quality_dtts)) {
+  dif_quality_dtts[i][[1]]$chrom <- as.character(dif_quality_dtts[i][[1]]$chrom)
+}
+
+dif_quality_dtt <- bind_rows(dif_quality_dtts, .id = 'file_info') |>
+  separate(file_info, c('species', 'library', NA, NA, 'method'), sep = '_') 
+
+write_tsv(dif_quality_dtt, 'results/merge_dif_quality_7.tsv')
+
+## random split data 14*2
+processed_files <- list.files('results', pattern = '\\.[12]_.*_merge.tsv', full.names = TRUE)
+names(processed_files) <- sub(r'(_merge.tsv)', '', basename(processed_files))
+
+split_dtts <- lapply(processed_files, get_ncorfs)
+
+for (i in names(split_dtts)) {
+  split_dtts[i][[1]]$chrom <- as.character(split_dtts[i][[1]]$chrom)
+}
+
+split_dtt <- bind_rows(split_dtts, .id = 'file_info') |>
+  separate(file_info, c('library','method'), sep = '_') |>
+  separate(library, c('library','split'), sep = '\\.(?!.*\\.)') 
+  
+write_tsv(split_dtt, 'results/merge_split_28.tsv')
+
+## sample (LCL Liver and Kidney) data 142
+processed_files <- list.files('results', pattern = 'sample_.*_merge.tsv', full.names = TRUE)
+names(processed_files) <- sub(r'(_merge.tsv)', '', basename(processed_files))
+
+sample_dtts <- lapply(processed_files, get_ncorfs)
+
+for (i in names(sample_dtts)) {
+  sample_dtts[i][[1]]$chrom <- as.character(sample_dtts[i][[1]]$chrom)
+}
+
+sample_dtt <- bind_rows(sample_dtts, .id = 'file_info') |>
+  separate(file_info, c('species', NA, 'sample', 'library', 'method'), sep = '_') 
+write_tsv(sample_dtt, 'results/merge_sample_142.tsv')
+
+## rep (Brain Testis and Liver) data 20
+processed_files <- list.files('results', pattern = 'rep_.*_merge.tsv', full.names = TRUE)
+names(processed_files) <- sub(r'(_merge.tsv)', '', basename(processed_files))
+
+rep_dtts <- lapply(processed_files, get_ncorfs)
+
+for (i in names(rep_dtts)) {
+  rep_dtts[i][[1]]$chrom <- as.character(rep_dtts[i][[1]]$chrom)
+}
+
+rep_dtt <- bind_rows(rep_dtts, .id = 'file_info') |>
+  separate(file_info, c('species', NA, 'sample', 'library', 'method'), sep = '_') 
+write_tsv(rep_dtt, 'results/merge_rep_20.tsv')
+
+```
+
+# Visualize annotation results
+
+## Verify the accuracy of the method by split datasets into two parts
+
+```{r}
+## Display the accuracy of ORF predicted by different methods
+library(tidyverse)
+split_orf <- read_tsv('results/merge_split_28.tsv')
+split_orf <- split_orf |>
+    mutate(method = case_when(
+    method == 'ribotricer' ~ 'RiboTricer', 
+    method == 'ribocode' ~ 'RiboCode', 
+    method == 'ribotish' ~ 'Ribo-TISH', 
+    method == 'riborf' ~ 'RibORF', 
+    method == 'price' ~ 'PRICE', 
+    .default = method))
+split_name <- unique(split_orf$library)
+
+split_jaccard <- NULL
+for (orf_method in unique(split_orf$method)) {
+  
+  for (i in split_name) {
+    split_tmp <- split_orf |>
+      filter(method == orf_method, 
+             library == i) |>
+      distinct(library, split, uuid)
+    
+    file_1 <- split_tmp |>
+      filter(split == 1)
+    file_2 <- split_tmp |>
+      filter(split == 2)
+    common_ORF <- file_1 |> 
+      filter(uuid %in% file_2$uuid)
+    total_num <- n_distinct(split_tmp$uuid)
+    
+    split_jaccard <- rbind(split_jaccard, c(i, nrow(file_1), nrow(file_2), 
+                                nrow(common_ORF), total_num, nrow(common_ORF)/total_num, 
+                                orf_method))
+      
+    }
+}
+split_jaccard <- as_tibble(split_jaccard) |>
+  mutate(split_name = V1, jaccard = V6, method = V7) |>
+  mutate(jaccard = as.numeric(jaccard))
+
+ggplot(split_jaccard, aes(method, jaccard, fill = method)) +
+  geom_boxplot() +
+  scale_fill_brewer(palette = 'Dark2') +
+  xlab(NULL) +
+  ylab('Jaccard index') +
+  theme_classic(base_size = 15) +
+  theme(strip.background = element_blank(), 
+        axis.text = element_text(colour = 'black'), 
+        axis.text.x = element_text(angle = 30, vjust = 1, hjust = 1)) +
+  guides(fill = F)
+ggsave('figures/split_boxplot.pdf', height = 3, width = 4)
+
+## Set selection criteria for coverage > 10
+split_coverage <- split_orf |>
+  mutate(coverage = psite_total/n_codon) |>
+  filter(coverage >= 10)
+
+split_coverage_jaccard <- NULL
+for (orf_method in unique(split_coverage$method)) {
+  
+  for (i in split_name) {
+    split_tmp <- split_coverage |>
+      filter(method == orf_method, 
+             library == i) |>
+      distinct(library, split, uuid)
+    
+    file_1 <- split_tmp |>
+      filter(split == 1)
+    file_2 <- split_tmp |>
+      filter(split == 2)
+    common_ORF <- file_1 |> 
+      filter(uuid %in% file_2$uuid)
+    total_num <- n_distinct(split_tmp$uuid)
+    
+    split_coverage_jaccard <- rbind(split_coverage_jaccard, c(i, nrow(file_1), nrow(file_2), 
+                                nrow(common_ORF), total_num, nrow(common_ORF)/total_num, 
+                                orf_method))
+      
+    }
+}
+split_coverage_jaccard <- as_tibble(split_coverage_jaccard) |>
+  mutate(split_name = V1, jaccard = V6, method = V7) |>
+  mutate(jaccard = as.numeric(jaccard))
+
+
+ggplot(split_coverage_jaccard, aes(method, jaccard, fill = method)) +
+  geom_boxplot() +
+  scale_fill_brewer(palette = 'Dark2') +
+  xlab(NULL) +
+  ylab('Jaccard index') +
+  theme_classic(base_size = 15) +
+  theme(strip.background = element_blank(), 
+        axis.text = element_text(colour = 'black'), 
+        axis.text.x = element_text(angle = 30, vjust = 1, hjust = 1)) +
+  guides(fill = F)
+ggsave('figures/split_boxplot_coverage10.pdf', height = 3, width = 4)
+
+## Distinguish between different ORF types
+split_jaccard_orf_type <- NULL
+for (orf_method in unique(split_orf$method)) {
+  for (i in split_name) {
+    for (j in unique(split_orf$orf_type)) {
+      split_tmp <- split_orf |>
+      filter(method == orf_method, 
+             library == i, 
+             orf_type == j) |>
+      distinct(library, split, uuid, orf_type)
+      
+      file_1 <- split_tmp |>
+        filter(orf_type == j, 
+               split == 1)
+      file_2 <- split_tmp |>
+        filter(orf_type == j, 
+               split == 2)
+      common_ORF <- file_1 |> 
+        filter(uuid %in% file_2$uuid)
+      total_num <- n_distinct(split_tmp$uuid)
+    
+      split_jaccard_orf_type <- rbind(split_jaccard_orf_type, c(i, nrow(file_1), nrow(file_2), 
+                                nrow(common_ORF), total_num, nrow(common_ORF)/total_num, 
+                                orf_method, j))
+    }
+  }
+}
+split_jaccard_orf_type <- as_tibble(split_jaccard_orf_type) |>
+  mutate(split_name = V1, jaccard = V6, method = V7, 
+         orf_type = ifelse(V8 == 'lncRNA-ORF', 'lncORF', V8), 
+         orf_type = factor(orf_type, levels = c('lncORF', 'uORF', 'uoORF', 'iORF', 'doORF', 'dORF'))) |>
+  mutate(jaccard = as.numeric(jaccard))
+
+ggplot(split_jaccard_orf_type, aes(x = method, jaccard, fill = method)) +
+  geom_boxplot(show.legend = F) +
+  scale_fill_brewer(palette = 'Dark2') +
+  facet_wrap(vars(orf_type), scales = 'free_y', nrow = 1) +
+  xlab(NULL) +
+  ylab('Jaccard index') +
+  theme_classic(base_size = 15) +
+  theme(strip.background = element_blank(), 
+        axis.text = element_text(colour = 'black'), 
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+ggsave('figures/split_boxplot_orf_type.pdf', height = 3, width = 15)
+
+```
+
+```{r}
+## 10 >coverage > 0.5
+split_coverage_less10 <- split_orf |>
+  mutate(coverage = psite_total/n_codon) |>
+  filter(coverage < 10)
+
+split_coverage_less10_jaccard <- NULL
+for (orf_method in unique(split_coverage_less10$method)) {
+  
+  for (i in split_name) {
+    split_tmp <- split_coverage_less10 |>
+      filter(method == orf_method, 
+             library == i) |>
+      distinct(library, split, uuid)
+    
+    file_1 <- split_tmp |>
+      filter(split == 1)
+    file_2 <- split_tmp |>
+      filter(split == 2)
+    common_ORF <- file_1 |> 
+      filter(uuid %in% file_2$uuid)
+    total_num <- n_distinct(split_tmp$uuid)
+    
+    split_coverage_less10_jaccard <- rbind(split_coverage_less10_jaccard, c(i, nrow(file_1), nrow(file_2), 
+                                nrow(common_ORF), total_num, nrow(common_ORF)/total_num, 
+                                orf_method))
+      
+    }
+}
+split_coverage_less10_jaccard <- as_tibble(split_coverage_less10_jaccard) |>
+  mutate(split_name = V1, jaccard = V6, method = V7) |>
+  mutate(jaccard = as.numeric(jaccard))
+
+split_coverage_jaccard$type <- '>=10'
+split_coverage_less10_jaccard$type <- '<10'
+plt <- rbind(split_coverage_jaccard, split_coverage_less10_jaccard)
+
+ggplot(plt, aes(x = type, y = jaccard, fill = type)) +
+  geom_line(aes(group = split_name), color = 'grey') +
+  geom_boxplot(show.legend = FALSE) +
+  scale_fill_brewer(palette = 'Paired') +
+  facet_wrap(vars(method), nrow = 1, scales = 'free') +
+  labs(x = 'P-sites/codon', y = 'Jaccard index') +
+  theme_classic(base_size = 12) +
+  theme(strip.background = element_blank(), 
+        axis.text = element_text(colour = 'black')) 
+ggsave('figures/splits_jaccard_vs_psite_per_codon.pdf', width = 8, height = 4)
+
+## Wilcoxon signed-rank tests
+plt |>
+  pivot_wider(id_cols = c(method, split_name), names_from = type, values_from = jaccard) |> 
+  summarise(pvalue = wilcox.test(`>=10`, `<10`, paired = TRUE)$p.value, .by = method)
+```
+
+## Different biological replicates（Brain, Liver, and Testis）
+
+```{r}
+## Display the accuracy of ORF predicted by different methods
+library(tidyverse)
+library(readxl)
+rep_infor <- read_xlsx('data/TableS4_additional_riboseq_libraries.xlsx') |>
+  filter(`Original publication` == 'Wang et al., 2020, Nature') |>
+  mutate(rep_name = paste0(Species, '_', Sample)) |>
+  select(library = `Accession code`, rep_name) |>
+  group_by(rep_name) |>
+  mutate(rep = row_number()) |>
+  ungroup()
+rep_orf <- read_tsv('results/merge_rep_20.tsv')
+rep_orf <- rep_orf |>
+    mutate(method = case_when(
+    method == 'ribotricer' ~ 'RiboTricer', 
+    method == 'ribocode' ~ 'RiboCode', 
+    method == 'ribotish' ~ 'Ribo-TISH', 
+    method == 'riborf' ~ 'RibORF', 
+    method == 'price' ~ 'PRICE', 
+    .default = method)) |>
+  left_join(rep_infor, by = 'library') 
+
+rep_jaccard <- NULL
+for (orf_method in unique(rep_orf$method)) {
+  for (i in unique(rep_orf$rep_name)) {
+    rep_tmp <- rep_orf |>
+      filter(method == orf_method, 
+             rep_name == i) |>
+      distinct(rep_name, rep, uuid)
+    for (j in 1:max(rep_tmp$rep)-1) {
+      file_1 <- rep_tmp |>
+        filter(rep == j) 
+      while (j+1 <= max(rep_tmp$rep)) {
+        j = j+1
+        file_2 <- rep_tmp |>
+          filter(rep == j)
+        common_ORF <- file_1 |> 
+          filter(uuid %in% file_2$uuid)
+        total_num <- length(unique(file_1$uuid, file_2$uuid))
+        
+        rep_jaccard <- rbind(rep_jaccard, 
+                             c(i, nrow(file_1), nrow(file_2), 
+                               nrow(common_ORF), total_num, 
+                               nrow(common_ORF)/total_num, orf_method))
+      }
+    }
+ }
+}
+rep_jaccard <- as_tibble(rep_jaccard) |>
+  mutate(rep_name = V1, Jaccard = V6, method = V7) |>
+  filter(Jaccard != 0)
+
+## Evaluate the accuracy of predictions using different biological replicates（Brain, Liver, and Testis）
+plt_rep <- rep_jaccard |>
+  mutate(Jaccard = as.numeric(Jaccard)) |>
+  separate(rep_name, into = c('species', 'sample'))
+
+ggplot(plt_rep, aes(x = method, y = Jaccard, fill = method)) +
+  geom_boxplot() +
+  scale_fill_brewer(palette = 'Dark2') +
+  facet_grid(rows = vars(species), cols = vars(sample)) +
+  xlab(NULL) +
+  ylab('Jaccard index') +
+  theme_classic(base_size = 15) +
+  theme(strip.background = element_blank(), 
+        axis.text = element_text(colour = 'black'), 
+        axis.text.x = element_text(angle = 30, vjust = 1, hjust = 1)) +
+  guides(fill = F)
+ggsave('figures/rep_boxplot_total.pdf', width = 8, height = 6)
+```
+
+## Different sample (LCL, Liver, and Kidney)
+
+```{r}
+library(tidyverse)
+sample_orf <- read_tsv('results/merge_sample_142.tsv')
+sample_orf <- sample_orf |>
+    mutate(method = case_when(
+    method == 'ribotricer' ~ 'RiboTricer', 
+    method == 'ribocode' ~ 'RiboCode', 
+    method == 'ribotish' ~ 'Ribo-TISH', 
+    method == 'riborf' ~ 'RibORF', 
+    method == 'price' ~ 'PRICE', 
+    .default = method)) |>
+  filter(!library %in% c('SRR1585533', 'SRR1585537', 'SRR1585544'))
+
+## Saturation analysis
+sample_reads_total <- read_tsv('data/sample_filter_reads_total.tsv') |>
+  separate(file_info, c('species', 'type', 'sampel', 'library'), sep = '_') |>
+  select(library, total = totals) |>
+  arrange(total)
+sample_saturation_orf <- sample_orf |>
+  select(library, method, uuid, sample) |>
+  left_join(sample_reads_total, by = 'library')
+
+sample_saturation_name <- sample_saturation_orf |>
+  distinct(library, method, uuid, sample) |>
+  count(library, method, sample) |>
+  arrange(desc(n))
+
+plt <- NULL
+for (i in unique(sample_saturation_name$sample)) {
+  tmp_sample <- sample_saturation_orf |>
+    filter(sample == i)
+  for (j in unique(sample_saturation_name$method)) {
+    tmp_method <- tmp_sample |>
+      filter(method == j)
+    for (z in 1:length(sample_saturation_name[sample_saturation_name$sample == i & sample_saturation_name$method == j, ]$library)) {
+      tmp <- tmp_method |>
+        filter(library %in% sample_saturation_name[sample_saturation_name$sample == i & sample_saturation_name$method == j, ]$library[1:z]) |>
+        summarise(orf_count = n_distinct(uuid), reads_count = sum(unique(total)), .by = c(method, sample))
+      plt <- rbind(plt, tmp)
+    }
+  }
+}
+
+ggplot(plt, aes(x = reads_count, y = orf_count)) +
+  geom_line(color = 'grey40') +
+  geom_point(size = 0.5) +
+  labs(x = 'Cumulative library size (M)', y = 'Cumulative number od ORFs (k)') +
+  scale_y_continuous(
+    labels = function(x){ ifelse(x == 0, '0', x / 1000) }) +
+  scale_x_continuous(
+    labels = function(x){ ifelse(x == 0, '0', x / 1000000) }) +
+  facet_wrap(sample ~ method, scales = 'free', nrow = 3) +
+  theme_classic(base_size = 12) +
+  theme(strip.background = element_blank(), 
+        axis.text = element_text(colour = 'black'))
+
+ggsave('figures/saturation_library_count.pdf', width = 12, height = 6)
+
+## orf_type
+sample_saturation_orf_type <- sample_orf |>
+  select(library, method, uuid, sample, orf_type) |>
+  left_join(sample_reads_total, by = 'library')
+write_tsv(sample_saturation_orf_type, 'data/sample_saturation_orf_type.tsv')
+
+```
+
+### Show the similarity of ORFs between two libraries using heatmap
+
+```{r}
+heatplot_sample <- function(sample_name) {
+  overlap <- NULL
+  for (orf_method in unique(sample_saturation_orf$method)) {
+    for (i in 1:nrow(sample_name)) {
+      lib_1 <- sample_saturation_orf |>
+        filter(method == orf_method, 
+               library == sample_name$library[i]) |>
+        distinct(uuid)
+      for (j in 1:nrow(sample_name)) {
+        lib_2 <- sample_saturation_orf |>
+          filter(method == orf_method, 
+                 library == sample_name$library[j]) |>
+          distinct(uuid)
+        common_ORF <- lib_1 |> 
+          filter(uuid %in% lib_2$uuid)
+        total_ORF <- rbind(lib_1, lib_2) |>
+          distinct(uuid)
+        overlap <- rbind(overlap, c(sample_name$library[i], sample_name$library[j], 
+                                    nrow(lib_1), nrow(lib_2), 
+                                    nrow(common_ORF), nrow(total_ORF), nrow(common_ORF)/nrow(total_ORF), 
+                                    orf_method))
+      }
+    }
+  }
+  
+  overlap <- overlap |> 
+    tibble::as_tibble() |>
+    rename(file1 = V1, file2 = V2, file1_count = V3, file2_count = V4, 
+           overlap_count = V5, total_count = V6, Jaccard = V7, method = V8) 
+}
+
+overlap_Kidney <- heatplot_sample(mouse_Kidney_name)
+overlap_Liver <- heatplot_sample(mouse_Liver_name)
+overlap_LCL <- heatplot_sample(human_LCL_name)
+
+overlap_Kidney$sample <- 'Kidney'
+overlap_Liver$sample <- 'Liver'
+overlap_LCL$sample <- 'LCL'
+
+sample_heatplot_jaccard <- rbind(overlap_Kidney, overlap_Liver, overlap_LCL) |>
+  mutate(Jaccard = as.double(Jaccard))
+
+plt_overlap <- sample_heatplot_jaccard |>
+  filter(file1_count != 0, file2_count != 0)
+  
+write_tsv(plt_overlap, 'data/sample_Jaccard_heatmap_plt.tsv')
+
+
+sample_reads_total <- read_tsv('data/sample_filter_reads_total.tsv') |>
+  separate(file_info, c('species', 'type', 'sampel', 'library'), sep = '_') |>
+  select(library, total = totals)
+
+sample_name_300w <- sample_reads_total |>
+  filter(total >= 3000000) |>
+  arrange(total)
+
+plt_overlap_300w <- read_tsv('data/sample_Jaccard_heatmap_plt.tsv') |>
+  filter(file1 %in% sample_name_300w$library, 
+         file2 %in% sample_name_300w$library)
+
+plt <- plt_overlap_300w |>
+  mutate(file1 = factor(file1, levels = sample_name_300w$library), 
+         file2 = factor(file2, levels = sample_name_300w$library))
+p1 <- plt |> filter(sample == 'LCL') |>
+  ggplot(aes(x=file1, y=file2, fill = Jaccard)) +
+  geom_tile(show.legend = F) +
+  coord_fixed() +
+  scale_fill_viridis_c() +
+  labs(x = NULL, y = NULL) +
+  theme_minimal() +
+  facet_grid(rows = vars(sample), cols = vars(method)) +
+  theme(axis.text = element_blank())
+
+p2 <- plt |> filter(sample == 'Liver') |>
+  ggplot(aes(x=file1, y=file2, fill = Jaccard)) +
+  geom_tile() +
+  coord_fixed() +
+  scale_fill_viridis_c() +
+  labs(x = NULL, y = NULL) +
+  theme_minimal() +
+  facet_grid(rows = vars(sample), cols = vars(method)) +
+  theme(axis.text = element_blank(), 
+        strip.text.x = element_blank())
+
+p3 <- plt |> filter(sample == 'Kidney') |>
+  ggplot(aes(x=file1, y=file2, fill = Jaccard)) +
+  geom_tile(show.legend = F) +
+  coord_fixed() +
+  scale_fill_viridis_c() +
+  labs(x = NULL, y = NULL) +
+  theme_minimal() +
+  facet_grid(rows = vars(sample), cols = vars(method)) +
+  theme(axis.text = element_blank(), 
+        strip.text.x = element_blank())
+p1 / p2 / p3 
+ggsave('figures/sample_Jaccard_heatmap_300w_sort_library_size.pdf', width = 10, height = 6)
+
+## Jaccard index between two methods 
+#' calculate Jaccard index between two sets
+jaccard <- function(x, y){
+    x <- unique(x)
+    y <- unique(y)
+    length(intersect(x, y))/length(union(x, y))
+}
+
+#' calculate average pairwise Jaccard index between three or more sets
+jaccard2 <- function(x){
+    j <- combn(x, 2, function(s){
+        jaccard(s[[1]], s[[2]])
+    })
+    mean(j)
+}
+sample_method_jaccard <- NULL
+for (lib in unique(sample_saturation_orf$library)) {
+  tmp <- sample_saturation_orf |>
+    filter(library == lib)
+  df_list <- split(tmp$uuid, tmp$method)
+  sample_method_jaccard <- rbind(sample_method_jaccard, c(library = lib, Jaccard = jaccard2(df_list), sample = tmp$sample[1]))
+}
+
+sample_reads_total <- read_tsv('data/sample_filter_reads_total.tsv') |>
+  separate(file_info, c('species', 'type', 'sampel', 'library'), sep = '_') |>
+  select(library, total = totals) |>
+  arrange(total)
+
+sample_method_jaccard <- as_tibble(sample_method_jaccard) |>
+  left_join(sample_reads_total, by = 'library') |>
+  mutate(Jaccard = as.numeric(Jaccard))
+sample_method_jaccard <- sample_method_jaccard|>
+  mutate(library = factor(library, levels = sample_method_jaccard$library))
+sample_method_jaccard <- sample_method_jaccard |>
+  filter(total >= 3000000)
+
+## coverage
+plt <- sample_method_jaccard |>
+  group_by(sample) |>
+  mutate(coverage_median = median(total), 
+         coverage = ifelse(total >= coverage_median, 'High', 'Low'))
+ggplot(plt, aes(x = sample, y = Jaccard, fill = coverage)) +
+  geom_boxplot() +
+  xlab(NULL) +
+  ylab('Jaccard index') +
+  theme_classic(base_size = 15) +
+  scale_fill_brewer(palette = 'Paired') +
+  theme(strip.background = element_blank(), 
+        axis.text = element_text(colour = 'black'))
+ggsave('figures/sample_Jaccard_method_coverage_boxplot.pdf', width = 6, height = 4)
+
+plt |> group_by(sample) |> 
+  summarize(pvalue = wilcox.test(Jaccard[coverage == 'High'],
+                                 Jaccard[coverage == 'Low'])$p.value)
+#   sample  pvalue
+#   <chr>    <dbl>
+# 1 Kidney 0.00169
+# 2 LCL    0.534  
+# 3 Liver  0.880
+```
+
+### Sensitivity and consistency vs library size analysis
+Utils
+```{r}
+#' calculate Jaccard index between two sets
+jaccard <- function(x, y){
+    x <- unique(x)
+    y <- unique(y)
+    length(intersect(x, y))/length(union(x, y))
+}
+
+#' calculate average pairwise Jaccard index between three or more sets
+jaccard2 <- function(x){
+    j <- combn(x, 2, function(s){
+        jaccard(s[[1]], s[[2]])
+    })
+    mean(j)
+}
+```
+
+```{r}
+multirep_meta <- fread('data/LeiTY/sample_reads_total.tsv')
+setnames(multirep_meta, c('species', 'sample', 'library', 'total'))
+multirep_jaccard <- fread('data/LeiTY/sample_Jaccard_heatmap_plt.tsv')
+
+plt <- multirep_meta[total > 3000000]
+plt[, bin := ifelse(total > median(total), 'High', 'Low'), by = .(species, sample)]
+plt <- plt[CJ(method = unique(multirep_jaccard$method), library), on = .(library)]
+plt <- plt[, {
+    tmp <- multirep_jaccard[
+        method == .BY$method & file1 %in% .SD$library & file2 %in% .SD$library]
+    tmp[file1 > file2, .(file1, file2, jaccard = Jaccard)]
+}, by = .(species, sample, method, bin)]
+plt[, sample := factor(sample, levels = c('LCL', 'Kidney', 'Liver'))]
+
+ggplot(plt, aes(x = sample, y = jaccard, fill = bin)) +
+    geom_boxplot(position = 'dodge') +
+    facet_wrap(facets = vars(method), nrow = 1, scales = 'free_y') +
+    labs(x = NULL, y = 'Jaccard', fill = NULL) +
+    scale_fill_brewer(palette = 'Dark2')
+ggsave('figures/multirep_jaccard_vs_libsize_groupby_method.pdf', width = 10, height = 3)
+```
+
+#### Sensitivity and consistency analysis
+```{r}
+mrlib_fine <- multirep_meta[total > 3000000]
+mrlib_fine[, table(sample)]
+# Kidney    LCL  Liver 
+#     44     47     26
+
+mrlib_orfs <- fread('data/jgg_ntg/multirep/sample_saturation_orf_type.tsv')
+all(mrlib_fine$library %in% unique(mrlib_orfs$library))  # TRUE
+mrlib_orfs <- mrlib_orfs[library %in% mrlib_fine$library]
+
+# determine well-translated ORFs
+orfs_pool <- mrlib_orfs[, .(lib_cnt = .N), by = .(sample, method, uuid)]
+orfs_stat <- orfs_pool[, .(orf_cnt = .N), .(sample, method, lib_cnt)]
+orfs_stat <- orfs_stat[, .(total = sum(orf_cnt), fine = sum(orf_cnt[lib_cnt >= 5])),
+                       keyby = .(method, sample)]
+orfs_stat[, prop := fine/total]
+orfs_stat
+#         method sample  total  fine       prop
+#  1:      PRICE Kidney   8358  1876 0.22445561
+#  2:      PRICE    LCL   5608   548 0.09771755
+#  3:      PRICE  Liver   6002  1365 0.22742419
+#  4:     RibORF Kidney 136376 58747 0.43077228
+#  5:     RibORF    LCL 161963 70020 0.43232096
+#  6:     RibORF  Liver  82485 37619 0.45607080
+#  7:  Ribo-TISH Kidney  19966  6870 0.34408494
+#  8:  Ribo-TISH    LCL  26217  6932 0.26440859
+#  9:  Ribo-TISH  Liver  12217  4235 0.34664811
+# 10:   RiboCode Kidney   7657  2789 0.36424187
+# 11:   RiboCode    LCL  12030  2118 0.17605985
+# 12:   RiboCode  Liver   4880  1755 0.35963115
+# 13: RiboTricer Kidney  85165 54040 0.63453297
+# 14: RiboTricer    LCL  92952 55383 0.59582365
+# 15: RiboTricer  Liver  56823 36123 0.63571089
+
+orfs_fine <- orfs_pool[lib_cnt >= 5]
+
+# sensitivity and specificity analysis
+calc_roc <- function(pred, true_pos, universe, check = FALSE){
+    true_neg <- setdiff(universe, true_pos)
+    tpr <- length(intersect(pred, true_pos)) / uniqueN(true_pos)
+    fpr <- length(intersect(pred, true_neg)) / length(true_neg)
+    return(list(TPR = tpr, FPR = fpr))
+}
+
+mrlib_roc <- mrlib_orfs[, {
+    universe <- orfs_pool[sample == .BY[['sample']] & method == .BY[['method']], uuid]
+    true_pos <- orfs_fine[sample == .BY[['sample']] & method == .BY[['method']], uuid]
+    calc_roc(uuid, true_pos = true_pos, universe = universe)
+}, by = .(sample, method, library)]
+
+mrlib_roc <- merge(mrlib_roc, mrlib_fine)
+mrlib_roc[, sample := factor(sample, levels = c('LCL', 'Kidney', 'Liver'))]
+
+ggplot(mrlib_roc, aes(x = FPR, y = TPR, color = method)) +
+    geom_point() +
+    geom_smooth(se = FALSE, method = 'loess', span = 0.9) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2) +
+    facet_wrap(facets = vars(sample), scales = 'free')
+ggsave('figures/multirep_roc_curve.pdf', width = 10, height = 3)
+
+ggplot(mrlib_roc, aes(x = total/1000000, y = TPR, color = method)) +
+    geom_smooth(method = 'lm', se = FALSE, size = 1) +
+    geom_point() +
+    scale_y_continuous(limits = c(0, 1)) +
+    facet_wrap(facets = vars(sample), scales = 'free') +
+    labs(x = 'Library size (M)', y = 'Sensitivity', color = NULL) +
+    scale_color_brewer(palette = 'Dark2')
+ggsave('figures/multirep_sensitivity_vs_libsize.pdf', width = 10, height = 3)
+
+# number of ORFs not well-translated vs library size
+mrlib_orf_cnt <- mrlib_orfs[, {
+    true_pos <- orfs_fine[sample == .BY[['sample']] & method == .BY[['method']], uuid]
+    list(num_orfs = uniqueN(uuid), well_tran = uniqueN(uuid[uuid %in% true_pos]))
+}, by = .(sample, method, library)]
+
+mrlib_orf_cnt[, other := num_orfs - well_tran]
+mrlib_orf_cnt <- merge(mrlib_orf_cnt, mrlib_fine)
+
+mrlib_orf_cnt[, sample := factor(sample, levels = c('LCL', 'Kidney', 'Liver'))]
+
+plt <- melt(mrlib_orf_cnt, id.vars = c('species', 'sample', 'library', 'method', 'total'),
+            measure.vars = c('well_tran', 'other'))
+plt[, variable := ifelse(variable == 'well_tran', 'Well-translated', 'Remaining ORFs')]
+plt[, variable := factor(variable, levels = c('Well-translated', 'Remaining ORFs'))]
+
+ggplot(plt, aes(x = total/1000000, y = value, color = variable)) +
+    geom_point() +
+    geom_smooth(se = FALSE, method = 'lm', span = 0.9) +
+    facet_wrap(facets = vars(sample, method), nrow = 3) +
+    scale_x_log10() + scale_y_log10() + scale_color_brewer(palette = 'Set1') +
+    labs(x = 'Library size (M)', y = 'Number of ORFs', color = NULL)
+ggsave('figures/multirep_num_orfs_vs_libsize.pdf', width = 10, height = 7)
+
+```
+
+Sensitivity of cumulative pooled ORFs
+```{r}
+# sort libraries in increasing size
+cumroc_inc <- mrlib_roc[order(sample, method, total)]
+cumroc_inc <- cumroc_inc[, {
+    res <- lapply(seq_along(library), function(i){
+        libs <- library[1:i]
+        universe <- orfs_pool[sample == .BY[['sample']] & method == .BY[['method']], uuid]
+        true_pos <- orfs_fine[sample == .BY[['sample']] & method == .BY[['method']], uuid]
+        orfs <- mrlib_orfs[library %in% libs, unique(uuid)]
+        calc_roc(orfs, true_pos = true_pos, universe = universe)
+    })
+    names(res) <- library
+    res <- rbindlist(res, idcol = 'library')
+    res[, `:=`(size = total, size_cum = cumsum(total))]
+    res
+}, by = .(species, sample, method)]
+
+cumroc_inc[, sample := factor(sample, levels = c('LCL', 'Kidney', 'Liver'))]
+ggplot(cumroc_inc, aes(x = size_cum/1000000, y = TPR, color = method)) +
+    geom_point() +
+    geom_vline(xintercept = 80, linetype = 2, color = 'darkred') +
+    geom_hline(yintercept = 0.8, linetype = 2, color = 'darkred') +
+    facet_wrap(facets = vars(sample), scales = 'free_x') +
+    labs(x = 'Cumulative library size (M)', y = 'Cumulative sensitivity', color = NULL) +
+    scale_color_brewer(palette = 'Dark2')
+ggsave('figures/multirep_sensitivity_vs_libsize_cumulative_increasing.pdf', width = 10, height = 3)
+
+# sort libraries in decreasing size
+cumroc_dec <- mrlib_roc[order(sample, method, -total)]
+cumroc_dec <- cumroc_dec[, {
+    res <- lapply(seq_along(library), function(i){
+        libs <- library[1:i]
+        universe <- orfs_pool[sample == .BY[['sample']] & method == .BY[['method']], uuid]
+        true_pos <- orfs_fine[sample == .BY[['sample']] & method == .BY[['method']], uuid]
+        orfs <- mrlib_orfs[library %in% libs, unique(uuid)]
+        calc_roc(orfs, true_pos = true_pos, universe = universe)
+    })
+    names(res) <- library
+    res <- rbindlist(res, idcol = 'library')
+    res[, `:=`(size = total, size_cum = cumsum(total))]
+    res
+}, by = .(species, sample, method)]
+
+cumroc_dec[, sample := factor(sample, levels = c('LCL', 'Kidney', 'Liver'))]
+ggplot(cumroc_dec, aes(x = size_cum/1000000, y = TPR, color = method)) +
+    geom_point() +
+    geom_vline(xintercept = 80, linetype = 2, color = 'darkred') +
+    geom_hline(yintercept = 0.9, linetype = 2, color = 'darkred') +
+    facet_wrap(facets = vars(sample), scales = 'free_x') +
+    labs(x = 'Cumulative library size (M)', y = 'Cumulative sensitivity', color = NULL) +
+    scale_color_brewer(palette = 'Dark2')
+ggsave('figures/multirep_sensitivity_vs_libsize_cumulative_decreasing.pdf', width = 10, height = 3)
+```
+
+
+## Batch effects
+
+```{r}
+HEK293_data_infor <- tribble(
+  ~library,        ~rep,             ~study, 
+  'SRR12660882',     3,      'Gillen.2021.Genome_Biol', 
+  'SRR12660881',     2,      'Gillen.2021.Genome_Biol', 
+  'SRR12660880',     1,      'Gillen.2021.Genome_Biol', 
+  'SRR2075925',      1,      'Iwasaki.2016.nature', 
+  'SRR2075936',      2,      'Iwasaki.2016.nature', 
+  'SRR8449569',      1,      'Martinez.2020.Nat_Chem_Biol', 
+  'SRR8449570',      2,      'Martinez.2020.Nat_Chem_Biol', 
+  'SRR10441364',     1,      'Patel.2020.Nucleic_Acids_Res', 
+  'SRR10441365',     2,      'Patel.2020.Nucleic_Acids_Res', 
+  'SRR6191037',      1,      'Sauer.2019.Nat_Commun', 
+  'SRR6191038',      2,      'Sauer.2019.Nat_Commun', 
+  'SRR6191039',      3,      'Sauer.2019.Nat_Commun', 
+  'SRR5227448',      1,      'Zhang.2017.Nat_Commun', 
+  'SRR5227449',      2,      'Zhang.2017.Nat_Commun'
+)
+batch_effect_orf <- read_tsv('results/merge_batch_effect_14.tsv')
+batch_effect_orf <- batch_effect_orf |>
+    mutate(method = case_when(
+    method == 'ribotricer' ~ 'RiboTricer', 
+    method == 'ribocode' ~ 'RiboCode', 
+    method == 'ribotish' ~ 'Ribo-TISH', 
+    method == 'riborf' ~ 'RibORF', 
+    method == 'price' ~ 'PRICE', 
+    .default = method)) 
+plt_batch_effect <- batch_effect_orf |>
+  distinct(library, method, uuid) |>
+  left_join(HEK293_data_infor, by = 'library')
+write_tsv(plt_batch_effect, 'data/HEK293_6study.tsv')
+
+library(eulerr)
+library(gridExtra)
+dif_quality_orf <- read_tsv('results/merge_dif_quality_7.tsv')
+dif_quality_orf <- dif_quality_orf |>
+    mutate(method = case_when(
+    method == 'ribotricer' ~ 'RiboTricer', 
+    method == 'ribocode' ~ 'RiboCode', 
+    method == 'ribotish' ~ 'Ribo-TISH', 
+    method == 'riborf' ~ 'RibORF', 
+    method == 'price' ~ 'PRICE', 
+    .default = method)) 
+
+dif_quality_data_infor <- tribble(
+  ~library,        ~rep,             ~study, 
+  'SRR10441364',     1,      'Patel.2020.Nucleic_Acids_Res', 
+  'SRR10441365',     2,      'Patel.2020.Nucleic_Acids_Res', 
+  'SRR6191037',      1,      'Sauer.2019.Nat_Commun', 
+  'SRR6191038',      2,      'Sauer.2019.Nat_Commun', 
+  'SRR6191039',      3,      'Sauer.2019.Nat_Commun', 
+  'SRR9300366',      1,      'Chang.2019.Nucleic_Acids_Res', 
+  'SRR9300367',      2,      'Chang.2019.Nucleic_Acids_Res'
+)
+
+plt_dif_quality <- dif_quality_orf |>
+  distinct(library, method, uuid, psite_total) |>
+  left_join(dif_quality_data_infor, by = 'library')
+write_tsv(plt_dif_quality, 'data/dif_quality_3study.tsv')
+
+chang_2019 <- plt_dif_quality |>
+  filter(study == 'Chang.2019.Nucleic_Acids_Res') |>
+  select(-psite_total)
+plt <- rbind(plt_batch_effect, chang_2019)
+plt <- plt |>
+  mutate(study = sub('\\.', '_', study), 
+         study = sub('\\..*', '', study))
+
+for (i in unique(plt$study)) {
+  for (j in unique(plt$method)) {
+    rep1 <- plt |>
+      filter(study == i, 
+             rep == 1, 
+             method == j)
+    rep2 <- plt |>
+      filter(study == i, 
+             rep == 2, 
+             method == j)
+    rep3 <- plt |>
+      filter(study == i, 
+             rep == 3, 
+             method == j)
+    orf_list <- list('rep1' = rep1$uuid, 'rep2' = rep2$uuid, 'rep3' = rep3$uuid)
+    
+    plot_method_name <- paste0('plot_', j)
+    assign(plot_method_name, plot(euler(orf_list), quantities = list(fontsize = 15), main = j))
+  }
+    file_name <- paste0('venn_', i)
+    assign(file_name, grid.arrange(plot_PRICE, plot_RiboCode, plot_RibORF, `plot_Ribo-TISH`, plot_RiboTricer, nrow = 1, top = i))
+}
+plot_venn <- grid.arrange(venn_Chang_2019, venn_Sauer_2019, venn_Zhang_2017, venn_Gillen_2021, 
+                                 venn_Martinez_2020, venn_Iwasaki_2016, venn_Patel_2020, nrow = 7)
+ggsave('figures/batch_effect_venn.pdf', plot_venn, width = 28, height = 30)
+
+# by method
+library(ggVennDiagram)
+for (i in unique(plt$study)) {
+  tmp <- plt |> filter(study == i)
+  ps <- lapply(unique(tmp$library), function(lib){
+    lib_orfs <- tmp |> filter(library == lib)
+    orf_list <- split(lib_orfs$uuid, lib_orfs$method)
+    ggVennDiagram(orf_list, label = 'count', label_alpha = 0) +
+      scale_fill_gradient(low = 'white', high = 'white') +
+      scale_color_manual(values = rep('black', 5)) +
+      labs(title = lib, fill = NULL) +
+      theme(plot.title = element_text(hjust = 0.5), 
+            legend.position = 'none') +
+      scale_x_continuous(expand = expansion(mult = 0.2))
+  })
+  file_name <- paste0('venn_method_', i)
+  assign(file_name, arrangeGrob(grobs = ps, nrow = 1, top = textGrob(i, gp = gpar(fontsize = 24))))
+}
+plot_venn_method <- grid.arrange(venn_method_Chang_2019, venn_method_Sauer_2019, venn_method_Zhang_2017, venn_method_Gillen_2021, 
+                                 venn_method_Martinez_2020, venn_method_Iwasaki_2016, venn_method_Patel_2020, nrow = 4)
+ggsave('figures/batch_effect_venn_method.pdf', plot_venn_method, width = 25, height = 15)
+
+```
+
+## Analysis of seven hek293 datasets
+```{r}
+hek_orfs <- fread('data/jgg_ntg/multirep/HEK293_6study.tsv')
+
+diffq_orfs <- fread('data/jgg_ntg/multirep/dif_quality_3study.tsv')
+diffq_orfs[, psite_total := NULL]
+
+diffq_orfs <- rbind(diffq_orfs[study == 'Chang.2019.Nucleic_Acids_Res'], hek_orfs)
+
+diffq_sim <- diffq_orfs[, {
+    orfs <- split(uuid, f = rep)
+    list(jaccard = jaccard2(orfs))
+}, by = .(method, study)]
+
+ggplot(diffq_sim, aes(y = study, x = jaccard)) +
+    geom_col() +
+    facet_wrap(facets = vars(method))
+
+# data quality
+frame_score <- fread('data/jgg_ntg/multirep/HEK293_frame_score.tsv')
+
+frame_score <- frame_score[, .(
+    study = str_replace_all(paper, ' ', '_'), species, library, rlen = match_len,
+    max_ratio, n_total = total, n_cds = cds_total)]
+frame_score[, rlen_prop := n_total/sum(n_total), by = .(library)]
+frame_score[, study := str_replace(study, 'Iwasaki_', 'Iwasaki')]
+frame_score_fine <- frame_score[max_ratio >= 0.6 & rlen_prop >= 0.1 & rlen >= 27 & rlen <= 35]
+
+fs_study <- rbind(
+    frame_score[rlen_prop >= 0.1 & rlen >= 27 & rlen <= 35 & study == 'Chang.2019.Nucleic_Acids_Res'],
+    frame_score_fine[study != 'Chang.2019.Nucleic_Acids_Res'])
+fs_study <- fs_study[, .(score = sum(n_total * max_ratio) / sum(n_total)), by = .(study)]
+
+plt <- merge(diffq_sim, fs_study, by = 'study', allow.cartesian = TRUE)
+plt[, study2 := str_replace(study, r'((.*?)\.(.*?)\..*?$)', r'(\1_\2)')]
+
+ggplot(plt, aes(x = score, y = jaccard)) +
+    geom_point(aes(fill = study2), size = 4, pch = 21, color = 'black', alpha = 0.8) +
+    geom_smooth(se = FALSE, method = 'lm', color = 'black', linetype = 2) +
+    facet_wrap(vars(method), scales = 'free') +
+    scale_fill_brewer(palette = 'Set1') +
+    labs(x = 'Fraction of in-frame reads', y = 'Jaccard between replicates', fill = NULL)
+ggsave('figures/diffq_inframe_frac_vs_jaccard_between_reps.pdf', width = 9, height = 6)
+
+plt[, {
+    t1 <- cor.test(jaccard, score)
+    list(corr = t1$estimate, pvalue = t1$p.value)
+}, by = .(method)]
+#        method      corr     pvalue
+# 1:      PRICE 0.7445453 0.05489874
+# 2:   RiboCode 0.7344539 0.06012449
+# 3:     RibORF 0.3565528 0.43242798
+# 4:  Ribo-TISH 0.7798232 0.03864877
+# 5: RiboTricer 0.7052300 0.07671778
+```
+
+### batch effects - HEK293 datasets
+```{r}
+pca <- diffq_orfs[, {
+    mtab <- dcast(.SD, uuid ~ library, fun.aggregate = length)
+    m <- as.matrix(mtab[, !"uuid"])
+    p <- prcomp(m, scale = TRUE)
+    as.data.table(p$rotation, idcol = 'library', keep.rownames = 'library')
+}, by = .(method)]
+
+pca <- merge(pca[, .(library, method, PC1, PC2, PC3)],
+             unique(diffq_orfs[, .(library, method, rep, study)]))
+pca[, study2 := str_replace(study, r'((.*?)\.(.*?)\..*?$)', r'(\1_\2)')]
+
+ggplot(pca, aes(x = PC1, y = PC2, fill = study2)) +
+    geom_point(size = 3, pch = 21, color = 'black', alpha = 0.8) +
+    facet_wrap(facets = vars(method), scales = 'free_x') +
+    scale_fill_brewer(palette = 'Set1') +
+    labs(fill = NULL) +
+    theme_bw(base_size = 12) +
+    theme(strip.background = element_blank(),
+          panel.grid = element_blank(),
+          axis.text = element_text(color = 'black'),
+          panel.border = element_rect(color = 'black'))
+ggsave('figures/batch_effects_pca_across_7_studies.pdf', width = 7, height = 4.5)
+
+ggplot(pca, aes(x = PC1, y = PC2, fill = study2)) +
+    geom_point(size = 3, pch = 21, color = 'black', alpha = 0.8) +
+    facet_wrap(facets = vars(method), scales = 'free', nrow = 1) +
+    scale_fill_brewer(palette = 'Set1') +
+    labs(fill = NULL)
+ggsave('figures/batch_effects_pca_across_7_studies_alt.pdf', width = 12, height = 2.5)
+```
+
+Variances within and between studies
+```{r}
+# create ORF presence/abscence matrix and convert to long format
+m <- dcast(diffq_orfs, method + uuid ~ library, fun.aggregate = length)
+m <- melt(m, id.vars = c('method', 'uuid'), variable.name = 'library')
+m <- merge(m, method_sim[, .(library, study2)], by = 'library')
+
+var_total <- m[, .(var_total = var(value) * (.N - 1)), by = .(method, uuid)]
+var_resid <- m[, .(var_resid = var(value) * (.N - 1)), by = .(method, uuid, study2)]
+var_resid <- var_resid[, .(var_resid = sum(var_resid)), by = .(method, uuid)]
+diffq_var <- merge(var_total, var_resid)
+
+var_stat <- diffq_var[, lapply(.SD, sum), by = .(method), .SDcols = c('var_total', 'var_resid')]
+var_stat[, var_study := (var_total - var_resid)]
+var_stat[, `:=`(prop_study = var_study/var_total, prop_resid = var_resid/var_total)]
+var_stat
+#        method var_total  var_resid  var_study prop_study prop_resid
+# 1:      PRICE  10469.31   4822.333   5646.979  0.5393840  0.4606160
+# 2:     RibORF 319900.19 105629.667 214270.521  0.6698043  0.3301957
+# 3:  Ribo-TISH  48776.88  20688.500  28088.375  0.5758543  0.4241457
+# 4:   RiboCode  19575.12   7252.833  12322.292  0.6294873  0.3705127
+# 5: RiboTricer 302962.31  94510.667 208451.646  0.6880448  0.3119552
+
+```
+
+Confirm that the results of variance analysis are equivalent to `aov`
+```{r}
+# 
+x <- m[uuid == '10_100267593_100256470_30-' & method == 'PRICE']
+aov(value ~ study2, data = x)
+#                 study2 Residuals
+# Sum of Squares  0.4375    0.5000
+# Deg. of Freedom      6         9
+
+var_total[uuid == '10_100267593_100256470_30-' & method == 'PRICE']
+#    method                       uuid var_total
+# 1:  PRICE 10_100267593_100256470_30-    0.9375
+var_resid[uuid == '10_100267593_100256470_30-' & method == 'PRICE']
+#    method                       uuid var_resid
+# 1:  PRICE 10_100267593_100256470_30-       0.5
+```
+
+
+### Quality vs consistency among methods
+```{r}
+fs_lib <- rbind(
+    frame_score[rlen_prop >= 0.1 & rlen >= 27 & rlen <= 35 & study == 'Chang.2019.Nucleic_Acids_Res'],
+    frame_score_fine[study != 'Chang.2019.Nucleic_Acids_Res'])
+fs_lib <- fs_lib[, .(score = sum(n_total * max_ratio) / sum(n_total)), by = .(study, library)]
+
+method_sim <- diffq_orfs[, .(jaccard = jaccard2(split(uuid, f = method))), by = .(study, rep, library)]
+method_sim <- merge(method_sim, fs_lib, by = c('study', 'library'))
+
+method_sim[, cor.test(jaccard, score)]
+# t = 3.6247, df = 14, p-value = 0.00276
+# alternative hypothesis: true correlation is not equal to 0
+# 95 percent confidence interval:
+#  0.3054404 0.8859341
+# sample estimates:
+#       cor 
+# 0.6957963
+
+method_sim[, study2 := str_replace(study, r'((.*?)\.(.*?)\..*?$)', r'(\1_\2)')]
+ggplot(method_sim, aes(x = score, y = jaccard)) +
+    geom_smooth(method = 'lm', se = FALSE, color = 'black', linetype = 2) +
+    geom_point(aes(fill = study2), size = 4, pch = 21, color = 'black') +
+    scale_fill_brewer(palette = 'Set1') +
+    labs(x = 'Fraction of in-frame reads', y = 'Jaccard across methods', fill = NULL)
+ggsave('figures/batch_effects_inframe_frac_vs_jaccard_across_method.pdf', width = 5, height = 3)
+```
+
+
+## Fly data anlysis
+
+```{r}
+## gxelab
+library(data.table)
+library(tidyverse)
+## Read transcript annotations
+FLY_tx_type <- read_tsv('data/id_mapping_FLY_lncRNA.tsv', col_names = F) |>
+  select('tx_name' = X3, 'g_name' = X6, 'tx_type' = X5)
+
+appris_dmel <- fread('data/ensemble_mart_export.txt')
+setnames(appris_dmel, c('gene_id', 'tx_name', 'appris'))
+
+appris_dmel[, appris := factor(appris, levels = c(
+  c("principal1", "principal2", "principal3", "principal4", "principal5",
+    "alternative1", "alternative2", "")))]
+
+## read file 
+get_ncorfs <- function(xpath){
+    # exclude annotated CDSs or truncation/extension variants
+    type_cds <- c(
+        'CDS', 'C_extension', 'C_truncation', 'N_extension',
+        'N_truncation', 'sCDS', 'iCDS', 'wCDS')
+    type_ncorf <- c('uORF', 'uoORF', 'iORF', 'doORF', 'dORF', 'lncRNA-ORF')
+    dtt <- fread(xpath) |>
+      mutate(txtype = ifelse(tx_name %in% FLY_tx_type$tx_name, 'lncRNA', txtype), 
+             orf_type = ifelse(tx_name %in% FLY_tx_type$tx_name, 'lncRNA-ORF', orf_type), 
+             uuid = paste0(chrom, '_', gstart, '_', gend, '_', orf_len, strand))
+    cds_variants <- dtt[orf_type %in% type_cds]
+    orfs <- dtt[!uuid %in% cds_variants$uuid]
+    orfs <- orfs[orf_type %in% type_ncorf]
+    orfs <- orfs[psite_total >= 10 & psite_total / n_codon >= 0.5 & orf_len >= 18]
+    orfs <- orfs[start_codon %in% c('ATG', 'CTG', 'GTG', 'TTG')]
+    
+    # assign ORFs to a single transcript based on appris score
+    orfs <- orfs |>
+      left_join(appris_dmel, by = c('gene_id', 'tx_name'))
+    orfs <- orfs[order(gene_id, appris, tx_name)]
+    orfs <- orfs[!duplicated(uuid)]
+    
+    # merge ORFs that are in the same transcripts and have the same stop codon
+    # keep the most upstream best-tier start codons
+    orfs[, start_tier := fct_collapse(
+        start_codon, AUG = 'ATG', SUG = c('CTG', 'GTG'),
+        UUG = 'TTG', other_level = 'other')]
+    orfs <- orfs[order(tx_name, tend, start_tier, tstart)]
+    orfs <- unique(orfs, by = c('tx_name', 'tend'))
+    
+    return(orfs)
+}
+
+processed_files <- list.files('results', pattern = 'dmel.*_merge.tsv', full.names = TRUE)
+names(processed_files) <- sub(r'(_merge.tsv)', '', basename(processed_files))
+
+dmel_dtts <- lapply(processed_files, get_ncorfs)
+
+for (i in names(dmel_dtts)) {
+  dmel_dtts[i][[1]]$chrom <- as.character(dmel_dtts[i][[1]]$chrom)
+}
+
+dmel_dtt <- bind_rows(dmel_dtts, .id = 'file_info') |>
+  separate(file_info, c(NA, 'library','method'), sep = '_')
+  
+write_tsv(dmel_dtt, 'results/merge_dmel_4.tsv')
+##
+dmel_gene_info <- read_tsv('data/Drosophila_melanogaster.BDGP6.32.52.gtf.txinfo') |>
+  distinct(tx_name, gene_id) |>
+  count(gene_id, name = 'tx_count')
+
+dmel_orf <- read_tsv('results/merge_dmel_4.tsv')
+dmel_orf <- dmel_orf |>
+    mutate(method = case_when(
+    method == 'ribotricer' ~ 'RiboTricer', 
+    method == 'ribocode' ~ 'RiboCode', 
+    method == 'ribotish' ~ 'Ribo-TISH', 
+    method == 'riborf' ~ 'RibORF', 
+    method == 'price' ~ 'PRICE', 
+    .default = method))
+
+dmel_orf_gene <- dmel_orf |>
+  inner_join(dmel_gene_info, by = 'gene_id') |>
+  mutate(tx_plt = ifelse(tx_count >= 2, 'Complex', 'Simple'), 
+         sample = ifelse(library %in% c('SRR1039767', 'SRR1039770'), 'oocyte', 'egg'))
+table(dmel_gene_info$tx_count)
+# ggplot(dmel_orf, aes(x = tx_plt)) + geom_bar()
+
+dmel_jaccard <- NULL
+for (orf_method in unique(dmel_orf_gene$method)) {
+  for (i in unique(dmel_orf_gene$sample)) {
+    for (j in unique(dmel_orf_gene$tx_plt)) {
+      dmel_tmp <- dmel_orf_gene |>
+        filter(method == orf_method, 
+               sample == i, 
+               tx_plt == j) |>
+        distinct(library, sample, uuid)
+    
+        file_1 <- dmel_tmp |>
+          filter(library == unique(dmel_tmp$library)[1])
+        file_2 <- dmel_tmp |>
+          filter(library == unique(dmel_tmp$library)[2])
+        common_ORF <- file_1 |> 
+          filter(uuid %in% file_2$uuid)
+        total_num <- n_distinct(dmel_tmp$uuid)
+        
+        dmel_jaccard <- rbind(dmel_jaccard, c(i, j, nrow(file_1), nrow(file_2), 
+                                    nrow(common_ORF), total_num, nrow(common_ORF)/total_num, 
+                                    orf_method))
+    }
+  }
+}
+dmel_jaccard <- as_tibble(dmel_jaccard) |>
+  mutate(sample = V1, tx_plt = V2, Jaccard = as.numeric(V7), method = V8, 
+         sample = ifelse(sample == 'egg', 'Activated eggs', 'Mature oocytes'))
+
+ggplot(dmel_jaccard, aes(x = method, y = Jaccard, fill = tx_plt)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  facet_wrap(~sample, nrow = 1) +
+  labs(x = NULL, y = 'Jaccard between replicates', fill = NULL) +
+  scale_fill_brewer(palette = 'Paired') +
+  theme_classic(base_size = 12) +
+  theme(strip.background = element_blank(), 
+        axis.text = element_text(colour = 'black'), 
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+ggsave('figures/dmel_gene_complexity_protein_coding.pdf', height = 3, width = 6)
+```
+
+# yeast data analysis
+
+```{r}
+library(tidyverse)
+read_tsv('data/Saccharomyces_cerevisiae_biomart.txt') |>
+  distinct() |>
+  count(`Gene stable ID`, name = 'transcript_count') |>
+  count(transcript_count) # 7127 1
+read_tsv('data/Saccharomyces_cerevisiae.R64-1-1.56.txinfo.txt') |>
+  distinct(tx_name, gene_id) |>
+  count(gene_id, name = 'tx_count') |>
+  count(tx_count) # 7127 1
+```
+
+```{bash}
+gppy txinfo -g data/Saccharomyces_cerevisiae.R64-1-1.56.gtf.gz > data/Saccharomyces_cerevisiae.R64-1-1.56.txinfo.txt
+cat data/Saccharomyces_cerevisiae.R64-1-1.56.txinfo.txt | sed 1d | cut -f 5 | sort | uniq -c
+   6779 1
+    328 2
+     15 3
+      2 4
+      1 5
+      1 6
+      1 8
+```
+
+```{r}
+plt <- tibble('n_exon' = as.character(c(1:6, 8)), 'count' = c(6779, 328, 15, 2, 1, 1, 1))
+ggplot(plt, aes(x = n_exon, y = count)) +
+  geom_bar(stat = "identity") +
+  scale_y_continuous(trans = 'log1p', breaks = c(0,1,10,100,1000,10000)) +
+  geom_text(aes(label = count), vjust = -0.5) +
+  labs(y = 'Number of gene', x = 'Number of exon') +
+  theme_classic() +
+  theme(axis.text = element_text(color = 'black'))
+ggsave('figures/yeast_gene_n_exon.pdf', height = 4, width = 5)
+```

@@ -1,0 +1,787 @@
+---
+title: "ORF prediction"
+format: html
+editor: source
+editor_options: 
+  chunk_output_type: console
+---
+
+# Preprocessing
+
+## Raw data
+
+### get proportion of reads in each frame
+
+```{bash}
+## get bam tsv
+for i in /nfs_data/zhangh/ncorf_benchmark/benchmark/human*RPF.*Aligned.toTranscriptome.out.bam ; do j=$(basename $i) ; echo "samtools view $i | cut -f1,3,4,6 > data/${j%%Aligned.toTranscriptome.out.bam}tsv" ; done > 01_bamtotsv.sh
+for i in /nfs_data/zhangh/ncorf_benchmark/benchmark/mouse*RPF.*Aligned.toTranscriptome.out.bam ; do j=$(basename $i) ; echo "samtools view $i | cut -f1,3,4,6 > data/${j%%Aligned.toTranscriptome.out.bam}tsv" ; done >> 01_bamtotsv.sh
+nohup ParaFly -c 01_bamtotsv.sh -CPU 8 -failed_cmds 01_bamtotsv.sh.failed &
+
+## run R to get ratio
+for i in data/human*.tsv ; do echo "Rscript --vanilla src/get_frame0_ratio.R $i /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/txinfo_human_ens104.tsv /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/ens104_appris_tsl_human.tsv ${i%%.tsv}_frame_ratio.tsv " ; done > 01_get_ratio.sh
+for i in data/mouse*.tsv ; do echo "Rscript --vanilla src/get_frame0_ratio.R $i /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/txinfo_mouse_ens106.tsv /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/ens106_appris_tsl_mouse.tsv ${i%%.tsv}_frame_ratio.tsv " ; done >> 01_get_ratio.sh
+nohup ParaFly -c 01_get_ratio.sh -CPU 8 -failed_cmds 01_get_ratio.sh.failed &
+
+```
+
+### get the proportion of in-frame reads and plot
+
+```{r}
+library(tidyverse)
+processed_files <- list.files('data', pattern = '(human|mouse)\\..*_frame_ratio.tsv', full.names = TRUE)
+names(processed_files) <- sub(r'(_frame_ratio.tsv)', '', basename(processed_files))
+
+ratio_list <- lapply(processed_files, read_tsv)
+all_ratios <- bind_rows(ratio_list, .id = 'file_info') |>
+  separate(file_info, c('species', 'sample', 'process', NA, 'rep'), sep = '\\.', remove = F)  |>
+  mutate(species = str_to_title(species))
+
+symname <- c(
+    "human.HEK293.control.RPF.r1", "human.HEK293.starvation.RPF.r1", "human.iCM.normal.RPF.r1", 
+    "human.iCM.normal.RPF.r2", "human.iCM.normal.RPF.r3", "human.iPSC.normal.RPF.r1", 
+    "human.iPSC.normal.RPF.r2", "human.iPSC.normal.RPF.r3", 
+    "mouse.BMDC.LPS2h.RPF.r1", "mouse.BMDC.LPS4h.RPF.r1", "mouse.BMDC.LPS8h.RPF.r1",  
+    "mouse.Liver.control.RPF.r1", "mouse.MEF.control.RPF.r1", "mouse.MEF.starvation.RPF.r1")
+
+all_ratio <- all_ratios |>
+  filter(file_info %in% symname) |>
+  group_by(file_info) |>
+  mutate(total_reads_ratio = total/sum(total), 
+         cutoff = ifelse(max_ratio >= 0.6, '>= 60%', '< 60%'), 
+         file_name = sub('(human|mouse)\\.', '', file_info)) |>
+  filter(match_len %in% 25:35)
+
+## plot total count ratio with different length
+all_ratio |>
+  mutate(name = paste0(str_to_title(species), ' ', gsub('\\.', ' ', file_name))) |>
+  ggplot(aes(x = match_len, y = total_reads_ratio, fill = max_ratio)) +
+  geom_bar(stat = "identity") +
+  scale_fill_viridis_b(name = 'In-frame rate') +
+  geom_hline(yintercept = 0.1, linetype = 'dashed', color = 'red') +
+  geom_vline(xintercept = 26.5, linetype = 'dashed', color = 'black') +
+  geom_vline(xintercept = 35.5, linetype = 'dashed', color = 'black') +
+  theme_classic(base_size = 12) +
+  facet_wrap(vars(name), scales = "free", nrow = 5) +
+  scale_x_continuous(breaks = 25:35) +
+  labs(y = NULL, x = NULL) +
+  theme(axis.text = element_text(color = 'black'), 
+        strip.background = element_blank())
+ggsave('figures/filter_length_fine.pdf', width = 10, height = 10)
+```
+
+### Filter the line in the bam file that specifies the reads length
+
+```{r}
+# filter length
+length_filter_sh <- all_ratio |>
+  filter(max_ratio >= 0.6, 
+         match_len %in% 27:35, 
+         total_reads_ratio >= 0.1) |>
+  select(file_info, match_len) |>
+  group_by(file_info) |>
+  summarise(len = str_c(match_len, collapse = ',')) |>
+  mutate(gene_sh = paste0('python src/filter_reads_len.py /nfs_data/zhangh/ncorf_benchmark/benchmark/', file_info, '.Aligned.sortedByCoord.out.bam -l ', len, ' -p data/', file_info, '.genome'), 
+         trans_sh = paste0('python src/filter_reads_len.py /nfs_data/zhangh/ncorf_benchmark/benchmark/', file_info, '.Aligned.toTranscriptome.out.bam -l ', len, ' -p data/', file_info, '.transcriptome'), 
+         sam_sh = paste0('python src/filter_reads_len_sam.py /nfs_data/zhangh/ncorf_benchmark/benchmark/', file_info, '.hisat2.sam -l ', len, ' -p data/', file_info))
+write_tsv(length_filter_sh, 'data/length_filter_sh.tsv')
+```
+
+## processing and mapping of major dataset
+```{r}
+source('src/sra_xml_v2.R')
+library(glue)
+
+# Chen 2020
+chen2020 <- parse_sra_xml('data/benchmark/GSE131650_Chen_2020_Science.xml') %>% mutate(
+    species = 'human',
+    sample = if_else(cell_type == 'iPSC', 'iPSC', 'iCM'),
+    condition = 'normal',
+    lib_type = if_else(lib_strategy == 'RNA-Seq', 'RNA', 'RPF'),
+    lib_type = ifelse(drug_treatment == 'no drug', lib_type, 'HTN')) %>%
+    arrange(run_acc) %>%
+    group_by(species, sample, condition, lib_type) %>%
+    mutate(rep = seq_len(n()),
+           name = paste(species, sample, condition, lib_type, paste0('r', rep), sep = '.')) %>%
+    ungroup() %>%
+    select(name, species, sample, condition, lib_type, lib_layout, rep, run_acc, run_url)
+
+# Gao2014
+gao2014 <- parse_sra_xml('data/benchmark/SRP049168_Gao_2014_Nat_methods.xml') %>%
+    filter(!grepl('S51D', exp_title)) %>%
+    mutate(
+        species = if_else(taxon == '9606', 'human', 'mouse'),
+        sample = case_when(grepl('Liver', exp_title) ~ 'Liver',
+                           grepl('MEF', exp_title)   ~ 'MEF',
+                           TRUE                      ~ 'HEK293'),
+        condition = case_when(grepl('Fasting', exp_title)               ~ 'fasting',
+                              grepl('Amino Acid Starvation', exp_title) ~ 'starvation',
+                              TRUE                                      ~ 'control'),
+        lib_type = case_when(grepl('QTI', exp_title)  ~ 'QTI',
+                             grepl('Ribo', exp_title) ~ 'RPF',
+                             TRUE                     ~ 'RNA')
+    ) %>%
+    arrange(run_acc) %>%
+    group_by(species, sample, condition, lib_type) %>%
+    mutate(rep = seq_len(n()),
+           name = paste(species, sample, condition, lib_type, paste0('r', rep), sep = '.')) %>%
+    select(name, species, sample, condition, lib_type, lib_layout, rep, run_acc, run_url)
+
+## Fields
+# fields2015_meta <- parse_sra_xml('data/benchmark/GSE74139_Fields_2015_Mol_Cell.xml') %>% arrange(run_acc)
+# writexl::write_xlsx(fields2015_meta, 'data/benchmark/GSE74139_Fields_2015_Mol_Cell.xlsx')
+fields2015 <- readxl::read_excel('data/benchmark/GSE74139_Fields_2015_Mol_Cell.xlsx') %>%
+    mutate(name = paste(species, sample, condition, lib_type, paste0('r', rep), sep = '.')) %>%
+    select(name, species, sample, condition, lib_type, lib_layout, rep, run_acc, run_url)
+
+# Bone Marrow-derived Dendritic Cell (BMDC) RNA-seq
+shalek2013 <- parse_sra_xml('data/benchmark/GSE41265_Shalek_2013_Nature.xml') %>%
+    mutate(species = 'mouse',
+           sample = 'BMDC',
+           condition = 'LPS4h',
+           lib_type = 'RNA',
+           rep = substring(sample_title, nchar(sample_title) -1),) %>%
+    group_by(sample, g = rep) %>%
+    mutate(
+        rep2 = paste(rep, seq_len(n()), sep='_'),
+        name = paste(species, sample, condition, lib_type, rep2, sep = '.')) %>%
+    ungroup() %>%
+    select(name, species, sample, condition, lib_type, lib_layout, rep, run_acc, run_url)
+
+pubdata <- list(chen2020, gao2014, fields2015, shalek2013)
+pubdata <- lapply(pubdata, function(x){mutate(x, rep = as.character(rep))})
+names(pubdata) <- c('chen2020', 'gao2014', 'fields2015', 'shalek2013')
+pubdata <- bind_rows(pubdata, .id = 'study')
+writexl::write_xlsx(pubdata, 'data/benchmark/cross_validation_data_summary.xlsx')
+
+pubdata <- readxl::read_xlsx('data/benchmark/cross_validation_data_summary_edited.xlsx')
+
+#' adapter sequences
+#' Gao2014: trimmed reads
+#' Chen2020: trimmed reads
+#' Fields2015: CTGTAGGCACCATCAATA (obtained by examining the raw fastq reads with human eye)
+
+pubdata %>%
+    filter(study %in% c('chen2020', 'gao2014')) %>%
+    mutate(cmd = paste0('mv ', run_acc, '.fastq.gz ', name, '.fq.gz')) %>%
+    pull(cmd) %>% cat(sep = '\n')
+
+pubdata %>%
+    filter(study %in% c('shalek2013')) %>%
+    mutate(cmd = paste0('mv ', run_acc, '_1.fastq.gz ', name, '.1.fq.gz')) %>%
+    pull(cmd) %>% cat(sep = '\n')
+
+pubdata %>%
+    filter(study %in% c('shalek2013')) %>%
+    mutate(cmd = paste0('mv ', run_acc, '_2.fastq.gz ', name, '.2.fq.gz')) %>%
+    pull(cmd) %>% cat(sep = '\n')
+
+pubdata %>%
+    filter(study %in% c('fields2015')) %>%
+    mutate(cmd = paste0('cutadapt -j8 --trim-n -m18 -a CTGTAGGCACCATCAATA -o ', name, '.fq.gz ', run_acc, '.fastq.gz')) %>%
+    pull(cmd) %>% cat(sep = '\n')
+
+# filter reads
+# bowtie2 -p {threads} --local --un-gz {output} -x {params.bt2_idx} -U {input} >/dev/null 2>{log}
+pubdata %>%
+    filter(!study %in% c('shalek2013')) %>%
+    mutate(cmd = paste0('bowtie2 -p 8 --local --un-gz ', name, '.clean.fq.gz -x ',
+                        '/nfs_data/database/ref_genomes/',
+                        if_else(species == 'human', 'human_GRCh38p13', 'mouse_GRCm39'),
+                        '/miscRNA/', species, '_rtRNA -U ',
+                        name, '.fq.gz', ' >/dev/null 2>', name, '.clean.log')) %>%
+    pull(cmd) %>% cat(sep = '\n')
+
+# mapping with STAR
+pubdata %>%
+    filter(lib_type %in% c('RPF', 'LTM', 'HTN', 'QTI')) %>%
+    mutate(cmd = paste0('STAR --outFilterType BySJout --runThreadN 16 --outFilterMismatchNmax 2 ',
+                        '--genomeDir /nfs_data/database/ref_genomes/',
+                        if_else(species == 'human', 'human_GRCh38p13', 'mouse_GRCm39'), '/STAR --readFilesIn ',
+                        name, '.clean.fq.gz  --outFileNamePrefix ', name, '. --readFilesCommand zcat ',
+                        '--outSAMtype BAM SortedByCoordinate --quantMode TranscriptomeSAM GeneCounts ',
+                        '--outFilterMultimapNmax 1 --outFilterMatchNmin 16 ',
+                        '--alignEndsType EndToEnd --outSAMattributes NH HI AS nM NM MD')) %>%
+    pull(cmd) %>% cat(sep = '\n')
+
+# mapping with hisat2
+pubdata %>%
+    filter(lib_type == 'RPF') %>%
+    mutate(cmd = paste0('hisat2 -p16 -x /nfs_data/database/ref_genomes/',
+                        if_else(species == 'human', 'human_GRCh38p13', 'mouse_GRCm39'), '/hisat2 -U ',
+                        name, '.clean.fq.gz -S ', name, 'hisat2.sam ',
+                        '2>', name, '.hisat2.log')) %>%
+    pull(cmd) %>% cat(sep = '\n')
+
+```
+
+## add additional data
+
+```{bash}
+## download Ribo-Seq and RNA-Seq data
+sed 1d filereport_read_run_PRJNA428526_yeast_tsv.txt | cut -f7 | sed 's/^/wget /g' > 00_download_yeast.sh
+nohup ParaFly -c 00_download_yeast.sh -CPU 2 -failed_cmds 00_download_yeast.sh.failed &
+```
+
+```{r}
+## merge yeast run
+library(tidyverse)
+yeast <- read_tsv('filereport_read_run_PRJNA428526_yeast_tsv.txt') 
+merge_run <- yeast[, c(1,3)] |>
+  mutate(run_accession = paste0(run_accession, '.fastq.gz')) |>
+  group_by(experiment_accession) |>
+  summarise(run = str_c(run_accession, collapse = ' ')) |>
+  mutate(sh = paste0('zcat ', run, ' | gzip > ', experiment_accession, '.fastq.gz'))
+write_tsv(merge_run[, 3], '00_merge_run.sh', col_names = F)
+```
+
+```{bash}
+## STAR human
+ln -s /nfs_data/database/riboseq/human/
+for i in *.trim.clean.fq.gz ; do echo "STAR --outFilterType BySJout --runThreadN 8 --outFilterMismatchNmax 2 --genomeDir /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/STAR --readFilesIn $i --outFileNamePrefix human_${i%%.trim.clean.fq.gz} --readFilesCommand zcat --outSAMtype BAM SortedByCoordinate --quantMode TranscriptomeSAM GeneCounts --outFilterMultimapNmax 1 --outFilterMatchNmin 16 --alignEndsType EndToEnd --outSAMattributes NH HI AS nM NM MD" ; done > 01_STAR.sh
+
+nohup ParaFly -c 01_STAR.sh -CPU 4 -failed_cmds 01_STAR.sh.failed &
+
+# get sam human
+for i in *.trim.clean.fq.gz; do  echo hisat2 -p8 -x /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/hisat2 -U $i -S human_${i%%.trim.clean.fq.gz}.hisat2.sam; done > 01_hisat2_getsam.sh
+for i in *_clean.trim.fq.gz; do  echo hisat2 -p8 -x /nfs_data/database/ref_genomes/Dmel_em52/hisat2 -U $i -S ${i%%_clean.trim.fq.gz}.hisat2.sam; done >> 01_hisat2_getsam.sh
+nohup ParaFly -c 01_hisat2_getsam.sh -CPU 4 -failed_cmds 01_hisat2_getsam.sh.failed &
+```
+
+### get in-frame proportion of reads with different length
+
+```{bash}
+## get bam tsv
+for i in *Aligned.toTranscriptome.out.bam ; do j=$(basename $i) ; echo "samtools view $i | cut -f1,3,4,6 > ${j%%Aligned.toTranscriptome.out.bam}.tsv" ; done > 02_bamtotsv.sh
+nohup ParaFly -c 02_bamtotsv.sh -CPU 8 -failed_cmds 02_bamtotsv.sh.failed &
+
+## run R to get ratio
+for i in human_*[0-9].tsv ; do echo "Rscript --vanilla ../../src/get_frame0_ratio.R $i /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/txinfo_human_ens104.tsv /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/ens104_appris_tsl_human.tsv ${i%%.tsv}_frame_ratio.tsv " ; done > 02_get_ratio.sh
+for i in SRR1039*[0-9].tsv ; do echo "Rscript --vanilla ../../src/get_frame0_ratio.R $i /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf.txinfo /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.appris.tsv ${i%%.tsv}_frame_ratio.tsv " ; done >> 02_get_ratio.sh
+nohup ParaFly -c 02_get_ratio.sh -CPU 8 -failed_cmds 02_get_ratio.sh.failed &
+
+```
+
+### select read lengths of high quality
+
+```{r}
+library(tidyverse)
+library(readxl)
+processed_files <- list.files('data', pattern = 'human_.*frame_ratio.tsv', full.names = TRUE)
+names(processed_files) <- sub(r'(_frame_ratio.tsv)', '', basename(processed_files))
+
+ratio_list <- lapply(processed_files, read_tsv)
+all_ratios <- bind_rows(ratio_list, .id = 'file_info') |>
+  separate(file_info, c('species', 'library'), sep = '_', remove = F)  
+
+## get library information
+library_info <- read_xlsx('data/human_HEK293_14library.xlsx') %>%
+  select(run_acc, rep, paper)
+all_ratios_add <- all_ratios |>
+  left_join(library_info, by = c('library' = 'run_acc')) |>
+  mutate(study = str_extract(paper, '.*\\d'))
+
+frame_score <- all_ratios_add |>
+  filter(!is.na(f0_percent), 
+         !is.na(study)) |>
+  group_by(library, study, rep) |>
+  mutate(cds_total_reads = sum(cds_total), 
+         len_score = max_ratio * (cds_total/cds_total_reads), 
+         rep = as.character(rep), 
+         match_len = as.character(match_len), 
+         total_reads_ratio = total/sum(total), 
+         type = ifelse(max_ratio >= 0.6, 'T', 'F')) |>
+  mutate(score = sum(len_score)) |>
+  filter(match_len %in% 25:35)
+write_tsv(frame_score, 'data/HEK293_frame_score.tsv')
+
+add_reads_total <- frame_score |>
+  mutate(all_total = sum(total)) |>
+  filter(max_ratio >= 0.6, 
+         match_len %in% 27:35, 
+         total_reads_ratio >= 0.1) |>
+  summarise(len = str_c(match_len, collapse = ','), 
+            totals = sum(total), 
+            ratio = totals / all_total[1])
+write_tsv(add_reads_total, 'data/HEK293_filter_reads_total.tsv')
+
+dif_quality_reads_total <- frame_score |>
+  mutate(all_total = sum(total)) |>
+  filter(study %in% c('Chang.2019', 'Sauer.2019', 'Patel.2020'), 
+         match_len %in% 27:35, 
+         total_reads_ratio >= 0.1) |>
+  summarise(len = str_c(match_len, collapse = ','), 
+            totals = sum(total), 
+            ratio = totals / all_total[1])
+write_tsv(dif_quality_reads_total, 'data/dif_quality_reads_total.tsv')
+```
+
+### Filter the line in the bam file that specifies the reads length
+
+```{r}
+# filter length
+length_filter_sh_add <- frame_score |>
+  filter(max_ratio >= 0.6, 
+         match_len %in% 27:35, 
+         total_reads_ratio >= 0.1) |>
+  select(file_info, match_len) |>
+  group_by(file_info) |>
+  summarise(len = str_c(match_len, collapse = ',')) |>
+  mutate(gene_sh = paste0('python src/filter_reads_len.py data/addition/', file_info, 'Aligned.sortedByCoord.out.bam -l ', len, ' -p data/', file_info, '.genome'), 
+         trans_sh = paste0('python src/filter_reads_len.py data/addition/', file_info, 'Aligned.toTranscriptome.out.bam -l ', len, ' -p data/', file_info, '.transcriptome'), 
+         sam_sh = paste0('python src/filter_reads_len_sam.py data/addition/', file_info, '.hisat2.sam -l ', len, ' -p data/', file_info))
+
+## different quality 
+length_filter_sh_add_dif_quality <- frame_score |>
+  filter(study %in% c('Chang.2019', 'Sauer.2019', 'Patel.2020'), 
+         match_len %in% 27:35, 
+         total_reads_ratio >= 0.1) |>
+  select(file_info, match_len) |>
+  group_by(file_info) |>
+  summarise(len = str_c(match_len, collapse = ',')) |>
+  mutate(gene_sh = paste0('python src/filter_reads_len.py data/addition/', file_info, 'Aligned.sortedByCoord.out.bam -l ', len, ' -p data/', file_info, '_dif_quality.genome'), 
+         trans_sh = paste0('python src/filter_reads_len.py data/addition/', file_info, 'Aligned.toTranscriptome.out.bam -l ', len, ' -p data/', file_info, '_dif_quality.transcriptome'), 
+         sam_sh = paste0('python src/filter_reads_len_sam.py data/addition/', file_info, '.hisat2.sam -l ', len, ' -p data/', file_info, '_dif_quality'))
+raw_data <- read_tsv('data/length_filter_sh.tsv')
+
+## add dmel data
+dmel_files <- list.files('data', pattern = 'SRR10397.*frame_ratio.tsv', full.names = TRUE)
+names(dmel_files) <- sub(r'(_frame_ratio.tsv)', '', basename(dmel_files))
+
+dmel_list <- lapply(dmel_files, read_tsv)
+dmel_ratios <- bind_rows(dmel_list, .id = 'file_info') 
+dmel_sh <- dmel_ratios |>
+  group_by(file_info) |>
+  mutate(total_reads_ratio = total/sum(total))|>
+  filter(max_ratio >= 0.6, 
+         match_len %in% 27:35, 
+         total_reads_ratio >= 0.1) |>
+  select(file_info, match_len) |>
+  group_by(file_info) |>
+  summarise(len = str_c(match_len, collapse = ',')) |>
+  mutate(gene_sh = paste0('python src/filter_reads_len.py data/addition/', file_info, 'Aligned.sortedByCoord.out.bam -l ', len, ' -p data/dmel_', file_info, '.genome'), 
+         trans_sh = paste0('python src/filter_reads_len.py data/addition/', file_info, 'Aligned.toTranscriptome.out.bam -l ', len, ' -p data/dmel_', file_info, '.transcriptome'), 
+         sam_sh = paste0('python src/filter_reads_len_sam.py data/addition/', file_info, '.hisat2.sam -l ', len, ' -p data/dmel_', file_info))
+```
+
+## add LCL, Kidney, Liver, Brain, and Testis data
+
+```{r}
+library(tidyverse)
+library(readxl)
+add_sample <- read_xlsx('data/TableS4_additional_riboseq_libraries.xlsx')
+record_rename <- read_tsv('data/00_rename.sh', col_names = F) |>
+  separate(X1, c(NA, 'Accession code', 'named'), sep = ' ') |>
+  mutate(`Accession code` = str_remove(`Accession code`, '.fastq.gz'), 
+         named = str_remove(named, '.fq.gz'))
+add_sample_sh <- add_sample |>
+  left_join(record_rename, by = 'Accession code') |>
+  mutate(ln = case_when(
+    `Original publication` == 'Battle et al., 2015, Science' ~ paste0('ln -s /nfs_data/database/riboseq/human/', `Accession code`, '.trim.clean.fq.gz data/add_sample/human_sample_LCL_', `Accession code`, '.trim.clean.fq.gz'), 
+    `Original publication` == 'Castelo-Szekely V et al., 2017, Genome Biol' ~ paste0('ln -s /nfs_data/database/riboseq/mouse/', `Accession code`, '.trim.clean.fq.gz data/add_sample/mouse_sample_Kidney_', `Accession code`, '.trim.clean.fq.gz'), 
+    `Original publication` == 'Janich et al., 2015, Genome Res' ~ paste0('ln -s /nfs_data/database/riboseq/mouse/', `Accession code`, '.trim.clean.fq.gz data/add_sample/mouse_sample_Liver_', `Accession code`, '.trim.clean.fq.gz'), 
+    `Original publication` == 'Wang et al., 2020, Nature' & Species == 'Human' & Sample == 'Brain' ~ paste0('ln -s /nfs_data/database/riboseq/human/', named, '.trim.clean.fq.gz data/add_sample/human_rep_Brain_', `Accession code`, '.trim.clean.fq.gz'), 
+    `Original publication` == 'Wang et al., 2020, Nature' & Species == 'Human' & Sample == 'Liver' ~ paste0('ln -s /nfs_data/database/riboseq/human/', named, '.trim.clean.fq.gz data/add_sample/human_rep_Liver_', `Accession code`, '.trim.clean.fq.gz'), 
+    `Original publication` == 'Wang et al., 2020, Nature' & Species == 'Human' & Sample == 'Testis' ~ paste0('ln -s /nfs_data/database/riboseq/human/', named, '.trim.clean.fq.gz data/add_sample/human_rep_Testis_', `Accession code`, '.trim.clean.fq.gz'), 
+    `Original publication` == 'Wang et al., 2020, Nature' & Species == 'Mouse' & Sample == 'Brain' ~ paste0('ln -s /nfs_data/database/riboseq/mouse/', named, '.trim.clean.fq.gz data/add_sample/mouse_rep_Brain_', `Accession code`, '.trim.clean.fq.gz'), 
+    `Original publication` == 'Wang et al., 2020, Nature' & Species == 'Mouse' & Sample == 'Liver' ~ paste0('ln -s /nfs_data/database/riboseq/mouse/', named, '.trim.clean.fq.gz data/add_sample/mouse_rep_Liver_', `Accession code`, '.trim.clean.fq.gz'), 
+    `Original publication` == 'Wang et al., 2020, Nature' & Species == 'Mouse' & Sample == 'Testis' ~ paste0('ln -s /nfs_data/database/riboseq/mouse/', named, '.trim.clean.fq.gz data/add_sample/mouse_rep_Testis_', `Accession code`, '.trim.clean.fq.gz')
+    ))
+write_tsv(add_sample_sh[, 6], 'data/01_add_sample_ln.sh', col_names = F)
+```
+
+```{bash}
+nohup sh 01_add_sample_ln.sh &
+
+## STAR human
+for i in human*.trim.clean.fq.gz ; do echo "STAR --outFilterType BySJout --runThreadN 8 --outFilterMismatchNmax 2 --genomeDir /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/STAR --readFilesIn $i --outFileNamePrefix ${i%%.trim.clean.fq.gz} --readFilesCommand zcat --outSAMtype BAM SortedByCoordinate --quantMode TranscriptomeSAM GeneCounts --outFilterMultimapNmax 1 --outFilterMatchNmin 16 --alignEndsType EndToEnd --outSAMattributes NH HI AS nM NM MD" ; done > 01_STAR.sh
+for i in mouse*.trim.clean.fq.gz ; do echo "STAR --outFilterType BySJout --runThreadN 8 --outFilterMismatchNmax 2 --genomeDir /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/STAR --readFilesIn $i --outFileNamePrefix ${i%%.trim.clean.fq.gz} --readFilesCommand zcat --outSAMtype BAM SortedByCoordinate --quantMode TranscriptomeSAM GeneCounts --outFilterMultimapNmax 1 --outFilterMatchNmin 16 --alignEndsType EndToEnd --outSAMattributes NH HI AS nM NM MD" ; done >> 01_STAR.sh
+nohup ParaFly -c 01_STAR.sh -CPU 4 -failed_cmds 01_STAR.sh.failed &
+
+# hisat2 human
+for i in human*.trim.clean.fq.gz; do echo hisat2 -p8 -x /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/hisat2 -U $i -S ${i%%.trim.clean.fq.gz}.hisat2.sam; done > 01_hisat2_getsam.sh
+for i in mouse*.trim.clean.fq.gz; do echo hisat2 -p8 -x /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/hisat2 -U $i -S ${i%%.trim.clean.fq.gz}.hisat2.sam; done >> 01_hisat2_getsam.sh
+nohup ParaFly -c 01_hisat2_getsam.sh -CPU 4 -failed_cmds 01_hisat2_getsam.sh.failed &
+```
+
+### get frame ratio with different length
+
+```{bash}
+## get bam tsv
+for i in *Aligned.toTranscriptome.out.bam ; do j=$(basename $i) ; echo "samtools view $i | cut -f1,3,4,6 > ${j%%Aligned.toTranscriptome.out.bam}.tsv" ; done > 02_bamtotsv.sh
+nohup ParaFly -c 02_bamtotsv.sh -CPU 8 -failed_cmds 02_bamtotsv.sh.failed &
+
+## run R to get ratio
+for i in human_*[0-9].tsv ; do echo "Rscript --vanilla ../../src/get_frame0_ratio.R $i /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/txinfo_human_ens104.tsv /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/ens104_appris_tsl_human.tsv ${i%%.tsv}_frame_ratio.tsv " ; done > 02_get_ratio.sh
+for i in mouse_*[0-9].tsv ; do echo "Rscript --vanilla /nfs_data/leity/poj/ncORF/jGG_revision/src/get_frame0_ratio.R $i /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/txinfo_mouse_ens106.tsv /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/ens106_appris_tsl_mouse.tsv ${i%%.tsv}_frame_ratio.tsv " ; done >> 02_get_ratio.sh
+nohup ParaFly -c 02_get_ratio.sh -CPU 8 -failed_cmds 02_get_ratio.sh.failed &
+
+```
+
+### select high quality read lengths
+
+```{r}
+library(tidyverse)
+library(readxl)
+processed_files <- list.files('data', pattern = '(sample|rep).*_frame_ratio.tsv', full.names = TRUE)
+names(processed_files) <- sub(r'(_frame_ratio.tsv)', '', basename(processed_files))
+
+ratio_list <- lapply(processed_files, read_tsv)
+all_ratios <- bind_rows(ratio_list, .id = 'file_info') |>
+  separate(file_info, c('species', 'library_type', 'sample', 'library'), sep = '_', remove = F)  
+
+frame_score <- all_ratios |>
+  filter(!is.na(f0_percent)) |>
+  group_by(file_info) |>
+  mutate(cds_total_reads = sum(cds_total), 
+         len_score = max_ratio * (cds_total/cds_total_reads), 
+         total_reads_ratio = total/sum(total), 
+         type = ifelse(max_ratio >= 0.6, 'T', 'F')) |>
+  mutate(score = sum(len_score)) |>
+  filter(match_len %in% 25:35)
+
+sample_reads_total <- frame_score |>
+  mutate(all_total = sum(total)) |>
+  filter(max_ratio >= 0.6, 
+         match_len %in% 27:35, 
+         total_reads_ratio >= 0.1) |>
+  summarise(len = str_c(match_len, collapse = ','), 
+            totals = sum(total), 
+            ratio = totals / all_total[1])
+write_tsv(sample_reads_total, 'data/sample_filter_reads_total.tsv')
+```
+
+### Filter the column in the bam file that specifies the reads length
+
+```{r}
+# filter length
+length_filter_sh_add_162 <- frame_score |>
+  filter(max_ratio >= 0.6, 
+         match_len %in% 27:35, 
+         total_reads_ratio >= 0.1) |>
+  select(file_info, match_len) |>
+  group_by(file_info) |>
+  summarise(len = str_c(match_len, collapse = ',')) |>
+  mutate(gene_sh = paste0('python src/filter_reads_len.py data/add_sample/', file_info, 'Aligned.sortedByCoord.out.bam -l ', len, ' -p data/', file_info, '.genome'), 
+         trans_sh = paste0('python src/filter_reads_len.py data/add_sample/', file_info, 'Aligned.toTranscriptome.out.bam -l ', len, ' -p data/', file_info, '.transcriptome'), 
+         sam_sh = paste0('python src/filter_reads_len_sam.py data/add_sample/', file_info, '.hisat2.sam -l ', len, ' -p data/', file_info))
+
+  
+## merge
+sh <- rbind(length_filter_sh_add, raw_data, length_filter_sh_add_dif_quality, dmel_sh, length_filter_sh_add_162)
+write_tsv(sh[, 3], 'data/01_filter_bam_reads_len_genome.sh', col_names = F)
+write_tsv(sh[, 4], 'data/01_filter_bam_reads_len_transcriptome.sh', col_names = F)
+write_tsv(sh[, 5], 'data/01_filter_sam_reads_len.sh', col_names = F)
+```
+
+```{bash}
+nohup ParaFly -c 01_filter_bam_reads_len_genome.sh -CPU 8 -failed_cmds 01_filter_bam_reads_len_genome.sh.failed &
+nohup ParaFly -c 01_filter_bam_reads_len_transcriptome.sh -CPU 8 -failed_cmds 01_filter_bam_reads_len_transcriptome.sh.failed &
+nohup ParaFly -c 01_filter_sam_reads_len.sh -CPU 8 -failed_cmds 01_filter_sam_reads_len.sh.failed &
+```
+
+## Verify the accuracy of the method by split datasets into two parts
+
+### Randomly split a genome/transcriptome bam file
+
+```{bash}
+# split bam
+for i in data/*.*.genome.bam data/*.*.transcriptome.bam ; do j=$(basename $i) ; echo "python /home/admin/scripts/bam_split.py $i -p data/${j%%.bam}" ; done > 01_split_bam.sh
+nohup ParaFly -c 01_split_bam.sh -CPU 8 -failed_cmds 01_split_bam.sh.failed &
+# change file name
+for i in data/*transcriptome.[12].bam ; do j=${i##*transcriptome.}; z=${i#*r[0-9]}; echo "mv $i ${i%%transcript*}${j%%.bam}${z%.*.*}.bam"; done > 01_split_bam_change_name.sh
+for i in data/*genome.[12].bam ; do j=${i##*genome.}; z=${i#*r[0-9]}; echo "mv $i ${i%%genome*}${j%%.bam}${z%.*.*}.bam"; done >> 01_split_bam_change_name.sh
+nohup ParaFly -c 01_split_bam_change_name.sh -CPU 8 -failed_cmds 01_split_bam_change_name.sh.failed &
+
+# split sam
+for i in data/human.*[0-9].sam data/mouse.*[0-9].sam ; do echo "python src/sam_split.py $i -p ${i%%.sam}" ; done > 01_split_sam.sh
+nohup ParaFly -c 01_split_sam.sh -CPU 8 -failed_cmds 01_split_sam.sh.failed &
+
+# build index for alignment files
+for i in data/*.genome.bam ; do echo " samtools index $i " ; done > 01_genome_index.sh
+nohup ParaFly -c 01_genome_index.sh -CPU 8 -failed_cmds 01_genome_index.sh.failed &
+```
+
+# ORF prediction
+
+## Ribo-TISH
+
+```{bash}
+## quality
+for i in data/human*.genome.bam ; do echo "ribotish quality --th 0.4 -b $i -g /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.104.gtf" ; done > 02_ribotish_quality.sh
+for i in data/mouse*.genome.bam ; do echo "ribotish quality --th 0.4 -b $i -g /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.106.gtf" ; done >> 02_ribotish_quality.sh
+for i in data/dmel*.genome.bam ; do echo "ribotish quality --th 0.4 -b $i -g /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf" ; done >> 02_ribotish_quality.sh
+nohup ParaFly -c 02_ribotish_quality.sh -CPU 8 -failed_cmds 02_ribotish_quality.sh.failed &
+
+vim data/human_SRR9300367_dif_quality.genome.bam.para.py # 32,33,34 to 32,33,34,35
+
+## predict
+for i in data/human*.genome.bam ; do j=$(basename $i) ; echo "ribotish predict -p2 --minaalen 5 --alt --altcodons CTG,GTG,TTG --framebest --fsqth 0.05 -b $i -g /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.104.gtf -f /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.dna.primary_assembly.fa -o data/ribotish/${j%%.genome.bam}_pred.txt" ; done > 02_ribotish_predict.sh
+for i in data/mouse*.genome.bam ; do j=$(basename $i) ; echo "ribotish predict -p2 --minaalen 5 --alt --altcodons CTG,GTG,TTG --framebest --fsqth 0.05 -b $i -g /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.106.gtf -f /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.dna.primary_assembly.fa -o data/ribotish/${j%%.genome.bam}_pred.txt" ; done >> 02_ribotish_predict.sh
+for i in data/dmel*.genome.bam ; do j=$(basename $i) ; echo "ribotish predict -p2 --minaalen 5 --alt --altcodons CTG,GTG,TTG --framebest --fsqth 0.05 -b $i -g /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf -f data/ribotish/Drosophila_melanogaster.BDGP6.32.dna.toplevel.fa -o data/ribotish/${j%%.genome.bam}_pred.txt" ; done >> 02_ribotish_predict.sh
+nohup ParaFly -c 02_ribotish_predict.sh -CPU 8 -failed_cmds 02_ribotish_predict.sh.failed &
+```
+
+## RiboCode
+
+```{bash}
+# activate environment and prepare annotation
+source /home/admin/env_mamba.sh
+mamba activate ribocode
+# prepare annotation
+## human
+prepare_transcripts -g /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.104.gtf -f /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.dna.primary_assembly.fa -o data/ribocode/annot_human &
+## mouse
+prepare_transcripts -g /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.106.gtf -f /nfs_data/database/ref_genomes/mouse_GRCm39/Mus_musculus.GRCm39.dna.primary_assembly.fa -o data/ribocode/annot_mouse &
+## dmel
+ln -s /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.dna.toplevel.fa data/ribocode/
+prepare_transcripts -g /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf -f data/ribocode/Drosophila_melanogaster.BDGP6.32.dna.toplevel.fa -o data/ribocode/annot_dmel &
+
+# estimate p-site offsets
+for i in data/human*.transcriptome.bam ; do j=$(basename $i) ; echo "metaplots -a data/ribocode/annot_human -r $i -f0_percent 0.1 -o data/ribocode/${j%%.transcriptome.bam}" ; done > 03_ribocode_metaplots.sh
+for i in data/mouse*.transcriptome.bam ; do j=$(basename $i) ; echo "metaplots -a data/ribocode/annot_mouse -r $i -f0_percent 0.1 -o data/ribocode/${j%%.transcriptome.bam}" ; done >> 03_ribocode_metaplots.sh
+for i in data/dmel*.transcriptome.bam ; do j=$(basename $i) ; echo "metaplots -a data/ribocode/annot_dmel -r $i -f0_percent 0.1 -o data/ribocode/${j%%.transcriptome.bam}" ; done >> 03_ribocode_metaplots.sh
+nohup /home/admin/mambaforge/bin/ParaFly -c 03_ribocode_metaplots.sh -CPU 8 -failed_cmds 03_ribocode_metaplots.sh.failed &
+
+# predict
+for i in data/ribocode/human*_pre_config.txt ; do j=$(basename $i) ; echo "RiboCode -a data/ribocode/annot_human -c $i -l no -g -s ATG -A CTG,GTG,TTG -m 5 -o data/ribocode/${j%%_pre_config.txt}" ; done > 03_ribocode_predict.sh
+for i in data/ribocode/mouse*_pre_config.txt ; do j=$(basename $i) ; echo "RiboCode -a data/ribocode/annot_mouse -c $i -l no -g -s ATG -A CTG,GTG,TTG -m 5 -o data/ribocode/${j%%_pre_config.txt}" ; done >> 03_ribocode_predict.sh
+for i in data/ribocode/dmel*_pre_config.txt ; do j=$(basename $i) ; echo "RiboCode -a data/ribocode/annot_dmel -c $i -l no -g -s ATG -A CTG,GTG,TTG -m 5 -o data/ribocode/${j%%_pre_config.txt}" ; done >> 03_ribocode_predict.sh
+nohup /home/admin/mambaforge/bin/ParaFly -c 03_ribocode_predict.sh -CPU 8 -failed_cmds 03_ribocode_predict.sh.failed &
+```
+
+## PRICE
+
+```{bash}
+# index genome
+# by default, index files are saved to the same dir as genome fasta and gtf. Meanwhile, create a ~/.gedi/genomic/${name}.oml file
+/home/admin/local/Gedi_1.0.5/gedi -e IndexGenome -s Homo_sapiens.GRCh38.dna.primary_assembly.fa -a Homo_sapiens.GRCh38.104.gtf -n hsa104 -nostar -nokallisto -nobowtie &
+/home/admin/local/Gedi_1.0.5/gedi -e IndexGenome -s Mus_musculus.GRCm39.dna.primary_assembly.fa -a Mus_musculus.GRCm39.106.gtf -n mmu106 -nostar -nokallisto -nobowtie &
+# create index dir and soft links to genome sequences annotation 
+mkdir data/price/price_index
+ln -s /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf data/price/price_index/
+ln -s /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.dna.toplevel.fa data/price/price_index/
+/home/admin/local/Gedi_1.0.5/gedi -e IndexGenome -s data/price/price_index/Drosophila_melanogaster.BDGP6.32.dna.toplevel.fa -a data/price/price_index/Drosophila_melanogaster.BDGP6.32.52.gtf -n Dmel_em52 -nostar -nokallisto -nobowtie &
+
+# predict
+for i in data/human*.genome.bam ; do j=$(basename $i) ; echo "/home/admin/local/Gedi_1.0.5/gedi -e Price -nthreads 16 -fdr 0.05 -skipmt -reads $i -genomic hsa104 -prefix data/price/${j%%.genome.bam}" ; done > 04_price_predict.sh
+for i in data/mouse*.genome.bam ; do j=$(basename $i) ; echo "/home/admin/local/Gedi_1.0.5/gedi -e Price -nthreads 16 -fdr 0.05 -skipmt -reads $i -genomic mmu106 -prefix data/price/${j%%.genome.bam}" ; done >> 04_price_predict.sh
+for i in data/dmel*.genome.bam ; do j=$(basename $i) ; echo "/home/admin/local/Gedi_1.0.5/gedi -e Price -nthreads 16 -fdr 0.05 -skipmt -reads $i -genomic Dmel_em52 -prefix data/price/${j%%.genome.bam}" ; done >> 04_price_predict.sh
+nohup ParaFly -c 04_price_predict.sh -CPU 2 -failed_cmds 04_price_predict.sh.failed &
+
+```
+
+## RiboTricer
+
+```{bash}
+# prepare
+## dmel
+ribotricer prepare-orfs --gtf data/price/price_index/Drosophila_melanogaster.BDGP6.32.52.gtf --fasta data/price/price_index/Drosophila_melanogaster.BDGP6.32.dna.toplevel.fa --prefix data/ribotricer/ntg_ribotricer/gene_prefix_dmel --min_orf_length 18 --start_codons ATG,CTG,GTG,TTG --longest &
+
+# predict
+for i in data/human*.genome.bam ; do j=$(basename $i) ; echo "ribotricer detect-orfs --stranded yes --phase_score_cutoff 0.44 --bam $i --ribotricer_index /nfs_data/zhangh/ncorf_benchmark/benchmark/ntg_ribotricer/human_candidate_orfs.tsv --prefix data/ribotricer/${j%%.genome.bam}" ; done > 05_ribotricer_predict.sh
+for i in data/mouse*.genome.bam ; do j=$(basename $i) ; echo "ribotricer detect-orfs --stranded yes --phase_score_cutoff 0.418 --bam $i --ribotricer_index /nfs_data/zhangh/ncorf_benchmark/benchmark/ntg_ribotricer/mouse_candidate_orfs.tsv --prefix data/ribotricer/${j%%.genome.bam}" ; done >> 05_ribotricer_predict.sh
+for i in data/dmel*.genome.bam ; do j=$(basename $i) ; echo "ribotricer detect-orfs --stranded yes --phase_score_cutoff 0.181 --bam $i --ribotricer_index data/ribotricer/ntg_ribotricer/gene_prefix_dmel_candidate_orfs.tsv --prefix data/ribotricer/${j%%.genome.bam}" ; done >> 05_ribotricer_predict.sh
+nohup ParaFly -c 05_ribotricer_predict.sh -CPU 8 -failed_cmds 05_ribotricer_predict.sh.failed &
+```
+
+## RibORF
+
+```{bash}
+# annotate ORFs
+gtfToGenePred /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.104.gtf  data/riborf/Homo_sapiens.GRCh38.104.genePred.txt &
+gtfToGenePred /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.106.gtf data/riborf/Mus_musculus.GRCm39.106.genePred.txt &
+gtfToGenePred /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf data/riborf/Drosophila_melanogaster.BDGP6.32.52.genePred.txt &
+
+mkdir data/riborf/annnot_human
+mkdir data/riborf/annnot_mouse
+mkdir data/riborf/annnot_dmel
+
+nohup perl /home/admin/local/RibORF.2.0/ORFannotate.pl -s "ATG/CTG/GTG/TTG" -l 18 -g /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.dna.primary_assembly.fa -t data/riborf/Homo_sapiens.GRCh38.104.genePred.txt -o data/riborf/annnot_human &
+nohup perl /home/admin/local/RibORF.2.0/ORFannotate.pl -s "ATG/CTG/GTG/TTG" -l 18 -g /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.dna.primary_assembly.fa -t data/riborf/Mus_musculus.GRCm39.106.genePred.txt -o data/riborf/annnot_mouse &
+nohup perl /home/admin/local/RibORF.2.0/ORFannotate.pl -s "ATG/CTG/GTG/TTG" -l 18 -g /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.dna.toplevel.fa -t data/riborf/Drosophila_melanogaster.BDGP6.32.52.genePred.txt -o data/riborf/annnot_dmel &
+# -l: cutoff of minimum candidate ORF length (including stop codon)
+
+# estimate p-site offset
+for i in data/*[^corrected].sam ; do j=$(basename $i) ; echo "mkdir data/riborf/${j%%.sam}" ; done > 06_riborf_mkdir.sh
+nohup ParaFly -c 06_riborf_mkdir.sh -CPU 8 -failed_cmds 06_riborf_mkdir.sh.failed &
+
+for i in data/human*[^corrected].sam ; do j=$(basename $i) ; echo "perl /home/admin/local/RibORF.2.0/readDist.pl -f $i -g data/riborf/Homo_sapiens.GRCh38.104.genePred.txt -o data/riborf/${j%%.sam} -d 27,28,29,30,31,32,33,34,35" ; done > 06_riborf_readDist.sh
+for i in data/mouse*[^corrected].sam ; do j=$(basename $i) ; echo "perl /home/admin/local/RibORF.2.0/readDist.pl -f $i -g data/riborf/Mus_musculus.GRCm39.106.genePred.txt -o data/riborf/${j%%.sam} -d 27,28,29,30,31,32,33,34,35" ; done >> 06_riborf_readDist.sh
+for i in data/dmel*[^corrected].sam ; do j=$(basename $i) ; echo "perl /home/admin/local/RibORF.2.0/readDist.pl -f $i -g data/riborf/Drosophila_melanogaster.BDGP6.32.52.genePred.txt -o data/riborf/${j%%.sam} -d 27,28,29,30,31,32,33,34,35" ; done >> 06_riborf_readDist.sh
+nohup ParaFly -c 06_riborf_readDist.sh -CPU 8 -failed_cmds 06_riborf_readDist.sh.failed &
+
+# run a script that estimates optimal read lengths to use with the ouput of the above step
+for i in data/riborf/human* data/riborf/mouse* data/riborf/dmel* ; do echo "Rscript --vanilla src/offset_est.R $i" ; done > 06_riborf_offsetEst_Rscript.sh
+nohup ParaFly -c 06_riborf_offsetEst_Rscript.sh -CPU 8 -failed_cmds 06_riborf_offsetEst_Rscript.sh.failed &
+
+# psite offset correction
+for i in data/riborf/human* data/riborf/mouse* data/riborf/dmel* ; do j=$(basename $i) ; echo "perl /home/admin/local/RibORF.2.0/offsetCorrect.pl -r data/$j.sam -p $i/offset.corretion.param -o data/$j.corrected.sam" ; done > 06_riborf_offsetCorrect.sh
+nohup ParaFly -c 06_riborf_offsetCorrect.sh -CPU 8 -failed_cmds 06_riborf_offsetCorrect.sh.failed &
+
+# predict
+for i in data/human*.corrected.sam ; do j=$(basename $i) ; echo "perl /home/admin/local/RibORF.2.0/ribORF.pl -f $i -c data/riborf/annnot_human/candidateORF.genepred.txt -o data/riborf/${j%%.corrected.sam}" ; done > 06_riborf_predict.sh
+for i in data/mouse*.corrected.sam ; do j=$(basename $i) ; echo "perl /home/admin/local/RibORF.2.0/ribORF.pl -f $i -c data/riborf/annnot_mouse/candidateORF.genepred.txt -o data/riborf/${j%%.corrected.sam}" ; done >> 06_riborf_predict.sh
+for i in data/dmel*.corrected.sam ; do j=$(basename $i) ; echo "perl /home/admin/local/RibORF.2.0/ribORF.pl -f $i -c data/riborf/annnot_dmel/candidateORF.genepred.txt -o data/riborf/${j%%.corrected.sam}" ; done >> 06_riborf_predict.sh
+nohup ParaFly -c 06_riborf_predict.sh -CPU 8 -failed_cmds 06_riborf_predict.sh.failed &
+```
+
+## Process prediction results of different methods using a unified pipeline with the same set of standards
+
+### Classify ORFs into different types
+
+```{bash}
+# PRICE
+for i in data/price/human*.orfs.tsv ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_type.py -m price -p results/${j%%.orfs.tsv}_price $i /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.104.gtf /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/txinfo_human_ens104.tsv" ; done > 07_orf_type.sh
+for i in data/price/mouse*.orfs.tsv ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_type.py -m price -p results/${j%%.orfs.tsv}_price $i /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.106.gtf /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/txinfo_mouse_ens106.tsv" ; done >> 07_orf_type.sh
+for i in data/price/dmel*.orfs.tsv ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_type.py -m price -p results/${j%%.orfs.tsv}_price $i /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf.txinfo" ; done >> 07_orf_type.sh
+
+# RiboCode
+for i in data/ribocode/human*_collapsed.txt ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_type.py -m ribocode -p results/${j%%_collapsed.txt}_ribocode $i /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.104.gtf /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/txinfo_human_ens104.tsv" ; done >> 07_orf_type.sh
+for i in data/ribocode/mouse*_collapsed.txt ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_type.py -m ribocode -p results/${j%%_collapsed.txt}_ribocode $i /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.106.gtf /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/txinfo_mouse_ens106.tsv" ; done >> 07_orf_type.sh
+for i in data/ribocode/dmel*_collapsed.txt ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_type.py -m ribocode -p results/${j%%_collapsed.txt}_ribocode $i /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf.txinfo" ; done >> 07_orf_type.sh
+
+# RiboTricer
+for i in data/ribotricer/human*_translating_ORFs.tsv ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_type.py -m ribotricer -p results/${j%%_translating_ORFs.tsv}_ribotricer $i /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.104.gtf /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/txinfo_human_ens104.tsv" ; done >> 07_orf_type.sh
+for i in data/ribotricer/mouse*_translating_ORFs.tsv ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_type.py -m ribotricer -p results/${j%%_translating_ORFs.tsv}_ribotricer $i /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.106.gtf /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/txinfo_mouse_ens106.tsv" ; done >> 07_orf_type.sh
+for i in data/ribotricer/dmel*_translating_ORFs.tsv ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_type.py -m ribotricer -p results/${j%%_translating_ORFs.tsv}_ribotricer $i /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf.txinfo" ; done >> 07_orf_type.sh
+
+# RiboTISH
+for i in data/ribotish/human*_pred.txt ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_type.py -m ribotish -p results/${j%%_pred.txt}_ribotish $i /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.104.gtf /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/txinfo_human_ens104.tsv" ; done >> 07_orf_type.sh
+for i in data/ribotish/mouse*_pred.txt ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_type.py -m ribotish -p results/${j%%_pred.txt}_ribotish $i /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.106.gtf /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/txinfo_mouse_ens106.tsv" ; done >> 07_orf_type.sh
+for i in data/ribotish/dmel*_pred.txt ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_type.py -m ribotish -p results/${j%%_pred.txt}_ribotish $i /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf.txinfo" ; done >> 07_orf_type.sh
+
+# RibORF
+for i in data/riborf/human* ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_type.py -m riborf -p results/${j}_riborf $i /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.104.gtf /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/txinfo_human_ens104.tsv" ; done >> 07_orf_type.sh
+for i in data/riborf/mouse* ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_type.py -m riborf -p results/${j}_riborf $i /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.106.gtf /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/txinfo_mouse_ens106.tsv" ; done >> 07_orf_type.sh
+for i in data/riborf/dmel* ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_type.py -m riborf -p results/${j}_riborf $i /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf.txinfo" ; done >> 07_orf_type.sh
+
+nohup ParaFly -c 07_orf_type.sh -CPU 8 -failed_cmds 07_orf_type.sh.failed &
+```
+
+### PSite pipeline
+
+#### by RNA-Seq data
+
+```{bash}
+## cutadapt
+for i in data/RNA_HEK293_*.fastq.gz ; do echo "cutadapt -a TGGAATTCTCGGGTG -j8 --trim-n -m 18 -o ${i%%.fastq.gz}_trim.fq.gz $i > ${i%%.fastq.gz}_trim.log "; done > 08_RNA_cutadapt.sh
+nohup ParaFly -c 08_RNA_cutadapt.sh -CPU 3 -failed_cmds 08_RNA_cutadapt.sh.failed &
+
+for i in data/RNA_HEK293_*_trim.fq.gz ; do echo "bowtie2 -p 8 --local --un-gz ${i%%.fq.gz}_clean.fq.gz -x /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/miscRNA/human_rtRNA -U $i >/dev/null 2>${i%%.fq.gz}_clean.log" ; done > 08_RNA_remove_rRNA.sh
+nohup ParaFly -c 08_RNA_remove_rRNA.sh -CPU 3 -failed_cmds 08_RNA_remove_rRNA.sh.failed &
+
+nohup salmon quant -p4 --seqBias --gcBias --posBias -l A -i /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/hsa_salmon_k19 -r data/RNA_HEK293_SRR12660883_trim_clean.fq.gz data/RNA_HEK293_SRR12660884_trim_clean.fq.gz data/RNA_HEK293_SRR12660885_trim_clean.fq.gz -o data/RNA_HEK293_salmon &
+
+for i in data/human_*.transcriptome.bam ; do j=$(basename $i) ; echo "psite train -i -t salmon -e data/RNA_HEK293_salmon/quant.sf /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.cdna.all.fa.gz $i data/psite/${j%%.transcriptome.bam} /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/txinfo_human_ens104.tsv "; done > 08_psite_train.sh
+
+echo "psite train -i -t salmon -e /nfs_data/leity/poj/new_fly/data/RNAseq/SRR1039761_salmon/quant.sf /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.cdna.all.fa.gz data/dmel_SRR1039767.transcriptome.bam data/psite/dmel_SRR1039767 /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf.txinfo
+psite train -i -t salmon -e /nfs_data/leity/poj/new_fly/data/RNAseq/SRR1039762_salmon/quant.sf /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.cdna.all.fa.gz data/dmel_SRR1039768.transcriptome.bam data/psite/dmel_SRR1039768 /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf.txinfo
+psite train -i -t salmon -e /nfs_data/leity/poj/new_fly/data/RNAseq/SRR1039764_salmon/quant.sf /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.cdna.all.fa.gz data/dmel_SRR1039770.transcriptome.bam data/psite/dmel_SRR1039770 /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf.txinfo
+psite train -i -t salmon -e /nfs_data/leity/poj/new_fly/data/RNAseq/SRR1039765_salmon/quant.sf /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.cdna.all.fa.gz data/dmel_SRR1039771.transcriptome.bam data/psite/dmel_SRR1039771 /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf.txinfo" >> 08_psite_train.sh
+
+for i in data/human.*.[12].transcriptome.bam ; do j=$(basename $i) ; echo "psite train -i -t salmon -e /nfs_data/zhangh/ncorf_benchmark/benchmark/salmon_${j%%.RPF*}.RNA/quant.sf /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.cdna.all.fa.gz $i data/psite/${j%%.transcriptome.bam} /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/txinfo_human_ens104.tsv "; done >> 08_psite_train.sh
+for i in data/mouse.*.[12].transcriptome.bam ; do j=$(basename $i) ; echo "psite train -i -t salmon -e /nfs_data/zhangh/ncorf_benchmark/benchmark/salmon_${j%%.RPF*}.RNA/quant.sf /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.cdna.all.fa.gz $i data/psite/${j%%.transcriptome.bam} /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/txinfo_mouse_ens106.tsv "; done >> 08_psite_train.sh
+```
+
+#### by appris principal isoform
+
+```{bash}
+for i in data/human_sample*.transcriptome.bam data/human_rep*.transcriptome.bam ; do j=$(basename $i) ; echo "psite train -i -t principal -e /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/ens104_appris_tsl_human.tsv /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.cdna.all.fa.gz $i data/psite/${j%%.transcriptome.bam} /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/txinfo_human_ens104.tsv" ; done >> 08_psite_train.sh
+for i in data/mouse_sample*.transcriptome.bam data/mouse_rep*.transcriptome.bam ; do j=$(basename $i) ; echo "psite train -i -t principal -e /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/ens106_appris_tsl_mouse.tsv /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.cdna.all.fa.gz $i data/psite/${j%%.transcriptome.bam} /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/txinfo_mouse_ens106.tsv" ; done >> 08_psite_train.sh
+
+nohup ParaFly -c 08_psite_train.sh -CPU 8 -failed_cmds 08_psite_train.sh.failed &
+```
+
+### Obtain the bam files with the P-site offset tag estimated by PSite package.
+
+```{bash}
+for i in data/human.*.genome.bam ; do j=$(basename $i) ; echo "psite predict /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.dna.primary_assembly.fa $i /nfs_data/zhangh/ncorf_benchmark/benchmark/psite_cov/${j%%.genome.bam}.psite.gbt.pickle data/psite/${j%%.genome.bam}.psite.genome.bam" ; done > 08_psite_predict.sh
+for i in data/human_*.genome.bam ; do j=$(basename $i) ; echo "psite predict /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.dna.primary_assembly.fa $i data/psite/${j%%.genome.bam}.gbt.pickle data/psite/${j%%.genome.bam}.psite.genome.bam" ; done >> 08_psite_predict.sh
+for i in data/mouse.*.genome.bam ; do j=$(basename $i) ; echo "psite predict /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.dna.primary_assembly.fa $i /nfs_data/zhangh/ncorf_benchmark/benchmark/psite_cov/${j%%.genome.bam}.psite.gbt.pickle data/psite/${j%%.genome.bam}.psite.genome.bam" ; done >> 08_psite_predict.sh
+for i in data/dmel*.genome.bam ; do j=$(basename $i) ; echo "psite predict /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.dna.toplevel.fa $i data/psite/${j%%.genome.bam}.gbt.pickle data/psite/${j%%.genome.bam}.psite.genome.bam" ; done >> 08_psite_predict.sh
+
+for i in data/human.*.[12].genome.bam ; do j=$(basename $i) ; echo "psite predict /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.dna.primary_assembly.fa $i data/psite/${j%%.genome.bam}.gbt.pickle data/psite/${j%%.genome.bam}.psite.genome.bam" ; done >> 08_psite_predict.sh
+for i in data/mouse*.[12].genome.bam ; do j=$(basename $i) ; echo "psite predict /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.dna.primary_assembly.fa $i data/psite/${j%%.genome.bam}.gbt.pickle data/psite/${j%%.genome.bam}.psite.genome.bam" ; done >> 08_psite_predict.sh
+nohup ParaFly -c 08_psite_predict.sh -CPU 8 -failed_cmds 08_psite_predict.sh.failed &
+
+## split: ribocode 
+for i in data/human.*.1.genome.bam data/mouse*.1.genome.bam ; do j=$(basename $i) ; echo "python src/bam_corresponding.py ${i%%.1.genome.bam}.genome.bam ${i%%.genome.bam}.transcriptome.bam ${i%%.1.genome.bam}.2.transcriptome.bam -p data/psite/psite_ribocode/${j%%.1.genome.bam}" ; done > 08_psite_ribocode_get_bam.sh
+nohup ParaFly -c 08_psite_ribocode_get_bam.sh -CPU 14 -failed_cmds 08_psite_ribocode_get_bam.sh.failed &
+## ribocode build index 
+for i in data/psite/psite_ribocode/* ; do echo " samtools index $i " ; done > 08_psite_ribocode_index.sh
+nohup ParaFly -c 08_psite_ribocode_index.sh -CPU 14 -failed_cmds 08_psite_ribocode_index.sh.failed &
+## ribocode predict 
+for i in data/psite/psite_ribocode/human.*.[12].bam ; do j=$(basename $i) ; echo "psite predict /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.dna.primary_assembly.fa $i data/psite/${j%%.bam}.gbt.pickle data/psite/${j%%.bam}.ribocode.psite.genome.bam" ; done >> 08_psite_predict.sh
+for i in data/psite/psite_ribocode/mouse*.[12].bam ; do j=$(basename $i) ; echo "psite predict /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.dna.primary_assembly.fa $i data/psite/${j%%.bam}.gbt.pickle data/psite/${j%%.bam}.ribocode.psite.genome.bam" ; done >> 08_psite_predict.sh
+nohup ParaFly -c 08_psite_predict.sh -CPU 14 -failed_cmds 08_psite_predict.sh.failed &
+
+## add sample & rep
+for i in data/human_sample*.genome.bam data/human_rep*.genome.bam ; do j=$(basename $i) ; echo "psite predict /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.dna.primary_assembly.fa $i data/psite/${j%%.genome.bam}.gbt.pickle data/psite/${j%%.genome.bam}.psite.genome.bam" ; done >> 08_psite_predict.sh
+for i in data/mouse_sample*.genome.bam data/mouse_rep*.genome.bam ; do j=$(basename $i) ; echo "psite predict /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.dna.primary_assembly.fa $i data/psite/${j%%.genome.bam}.gbt.pickle data/psite/${j%%.genome.bam}.psite.genome.bam" ; done >> 08_psite_predict.sh
+nohup ParaFly -c 08_psite_predict.sh -CPU 16 -failed_cmds 08_psite_predict.sh.failed &
+```
+
+### Quantify the predicted ORFs
+
+```{bash}
+for i in data/psite/*.psite.genome.bam ; do echo "psite coverage $i ${i%%.psite.genome.bam}.genome" ; done > 09_orf_quant_coverage.sh
+nohup ParaFly -c 09_orf_quant_coverage.sh -CPU 8 -failed_cmds 09_orf_quant_coverage.sh.failed &
+
+# TX_BED12
+gppy convert2bed -g /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf > data/orfquant/Drosophila_melanogaster.BDGP6.32.52.bed
+
+for i in results/human*_processed.tsv ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_quant.py data/psite/${j%_*_*}.genome_fw.bw data/psite/${j%_*_*}.genome_rc.bw /nfs_data/zhangh/ncorf_benchmark/benchmark/genome_annot/Homo_sapiens.GRCh38.104.transcripts.bed12 $i -o ${i%%_processed.tsv}_orfquant.tsv" ; done > 09_orf_quant.sh
+for i in results/mouse*_processed.tsv ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_quant.py data/psite/${j%_*_*}.genome_fw.bw data/psite/${j%_*_*}.genome_rc.bw /nfs_data/zhangh/ncorf_benchmark/benchmark/genome_annot/Mus_musculus.GRCm39.106.transcripts.bed12 $i -o ${i%%_processed.tsv}_orfquant.tsv" ; done >> 09_orf_quant.sh
+for i in results/dmel*_processed.tsv ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_quant.py data/psite/${j%_*_*}.genome_fw.bw data/psite/${j%_*_*}.genome_rc.bw data/orfquant/Drosophila_melanogaster.BDGP6.32.52.bed $i -o ${i%%_processed.tsv}_orfquant.tsv" ; done >> 09_orf_quant.sh
+
+sed -i '/\.[12]_ribocode/d' 09_orf_quant.sh # Delete lines that contain 'ribocode'
+## add ribocode
+for i in results/human*.[12]_ribocode_processed.tsv ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_quant.py data/psite/${j%_*_*}.ribocode.genome_fw.bw data/psite/${j%_*_*}.ribocode.genome_rc.bw /nfs_data/zhangh/ncorf_benchmark/benchmark/genome_annot/Homo_sapiens.GRCh38.104.transcripts.bed12 $i -o ${i%%_processed.tsv}_orfquant.tsv" ; done >> 09_orf_quant.sh
+for i in results/mouse*.[12]_ribocode_processed.tsv ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_quant.py data/psite/${j%_*_*}.ribocode.genome_fw.bw data/psite/${j%_*_*}.ribocode.genome_rc.bw /nfs_data/zhangh/ncorf_benchmark/benchmark/genome_annot/Mus_musculus.GRCm39.106.transcripts.bed12 $i -o ${i%%_processed.tsv}_orfquant.tsv" ; done >> 09_orf_quant.sh
+
+nohup ParaFly -c 09_orf_quant.sh -CPU 24 -failed_cmds 09_orf_quant.sh.failed & #1142
+```
+
+### Compute Fragment Length Organization Similarity Score (FLOSS)
+
+```{bash}
+# get index
+for i in data/psite/*.psite.genome.bam ; do echo "samtools index $i " ; done > 10_psite_genome_index.sh
+nohup ParaFly -c 10_psite_genome_index.sh -CPU 8 -failed_cmds 10_psite_genome_index.sh.failed &
+
+## get dmel.cdsmerge.bed
+gppy convert2bed -t cds -g /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf | bedtools bed12tobed6 | bedtools sort | bedtools merge -s -c 4,5,6 -o first > data/orfquant/Drosophila_melanogaster.BDGP6.32.52.cdsmerge.bed
+
+## floss
+for i in results/human*_processed.tsv ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_floss.py data/psite/${j%_*_*}.psite.genome.bam /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.104.gtf  /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/txinfo_human_ens104.tsv /nfs_data/zhangh/ncorf_benchmark/benchmark/genome_annot/Homo_sapiens.GRCh38.104.cdsmerge.bed $i -o ${i%%_processed.tsv}_floss.tsv" ; done > 10_orf_floss.sh
+for i in results/mouse*_processed.tsv ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_floss.py data/psite/${j%_*_*}.psite.genome.bam /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.106.gtf  /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/txinfo_mouse_ens106.tsv /nfs_data/zhangh/ncorf_benchmark/benchmark/genome_annot/Mus_musculus.GRCm39.106.cdsmerge.bed $i -o ${i%%_processed.tsv}_floss.tsv" ; done >> 10_orf_floss.sh
+for i in results/dmel*_processed.tsv ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_floss.py data/psite/${j%_*_*}.psite.genome.bam /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.52.gtf.txinfo data/orfquant/Drosophila_melanogaster.BDGP6.32.52.cdsmerge.bed $i -o ${i%%_processed.tsv}_floss.tsv" ; done >> 10_orf_floss.sh
+sed -i '/\.[12]_ribocode/d' 10_orf_floss.sh # Delete lines that contain 'ribocode'
+## add ribocode
+for i in results/human*.[12]_ribocode_processed.tsv ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_floss.py data/psite/${j%_*_*}.ribocode.psite.genome.bam /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.104.gtf  /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/txinfo_human_ens104.tsv /nfs_data/zhangh/ncorf_benchmark/benchmark/genome_annot/Homo_sapiens.GRCh38.104.cdsmerge.bed $i -o ${i%%_processed.tsv}_floss.tsv" ; done >> 10_orf_floss.sh
+for i in results/mouse*.[12]_ribocode_processed.tsv ; do j=$(basename $i) ; echo "python ~admin/scripts/orf_floss.py data/psite/${j%_*_*}.ribocode.psite.genome.bam /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.106.gtf  /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/txinfo_mouse_ens106.tsv /nfs_data/zhangh/ncorf_benchmark/benchmark/genome_annot/Mus_musculus.GRCm39.106.cdsmerge.bed $i -o ${i%%_processed.tsv}_floss.tsv" ; done >> 10_orf_floss.sh
+
+nohup ParaFly -c 10_orf_floss.sh -CPU 8 -failed_cmds 10_orf_floss.sh.failed & ##1142
+
+# floss cutoff
+for i in results/*_floss.tsv ; do echo "Rscript --vanilla ~admin/scripts/orf_floss_cutoff.R $i ${i%%.tsv}_cutoff.tsv" ; done > 10_orf_floss_cutoff.sh
+nohup ParaFly -c 10_orf_floss_cutoff.sh -CPU 8 -failed_cmds 10_orf_floss_cutoff.sh.failed &
+```
+
+### Extract Kozak sequence context for predicted ORFs
+
+```{bash}
+for i in results/human*_processed.tsv ; do echo "python ~admin/scripts/orf_kozak.py -i -f /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.cdna.all.fa.gz -f /nfs_data/database/ref_genomes/human_GRCh38p13/ens104/Homo_sapiens.GRCh38.ncrna.fa.gz $i > ${i%%_processed.tsv}_kozak.tsv" ; done > 11_orf_kozak.sh
+for i in results/mouse*_processed.tsv ; do echo "python ~admin/scripts/orf_kozak.py -i -f /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.cdna.all.f
+a.gz -f /nfs_data/database/ref_genomes/mouse_GRCm39/ens106/Mus_musculus.GRCm39.ncrna.fa.gz $i > ${i%%_processed.tsv}_kozak.tsv" ; done >> 11_orf_kozak.sh
+for i in results/dmel*_processed.tsv ; do echo "python ~admin/scripts/orf_kozak.py -i -f /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.cdna.all.fa.gz -f /nfs_data/database/ref_genomes/Dmel_em52/Drosophila_melanogaster.BDGP6.32.ncrna.fa.gz $i > ${i%%_processed.tsv}_kozak.tsv" ; done >> 11_orf_kozak.sh
+nohup ParaFly -c 11_orf_kozak.sh -CPU 8 -failed_cmds 11_orf_kozak.sh.failed &
+```
+
+### Merge annotation results
+
+```{bash}
+for i in results/*_processed.tsv ; do echo "python ~admin/scripts/orf_mergetab.py $i -q ${i%%_processed.tsv}_orfquant.tsv -f ${i%%_processed.tsv}_floss_cutoff.tsv -k ${i%%_processed.tsv}_kozak.tsv -o ${i%%_processed.tsv}_merge.tsv" ; done > 12_orf_merge.sh
+nohup ParaFly -c 12_orf_merge.sh -CPU 8 -failed_cmds 12_orf_merge.sh.failed &
+```
